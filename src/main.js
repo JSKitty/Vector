@@ -118,6 +118,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
             // Bring the focus back to the chat
             domChatMessageInput.focus();
+        } else if (e.code === 'Escape') {
+            // Close the dialog
+            emojiSearch.value = '';
+            picker.classList.remove('active');
+
+            // Bring the focus back to the chat
+            domChatMessageInput.focus();
         }
     };
 
@@ -416,9 +423,18 @@ function updateChat(contact) {
                 }
                 // Construct the text content
                 const pMessage = document.createElement('p');
-                // Render their text content (using our custom Markdown renderer)
-                // NOTE: the input IS HTML-sanitised, however, heavy auditing of the sanitisation method should be done, it is a bit sketchy
-                pMessage.innerHTML = parseMarkdown(msg.content);
+                // If it's emoji-only, and less than four emojis, format them nicely
+                const strEmojiCleaned = msg.content.replace(/\s/g, '');
+                if (isEmojiOnly(strEmojiCleaned) && strEmojiCleaned.length <= 6) {
+                    // Strip out unnecessary whitespace
+                    pMessage.textContent = strEmojiCleaned
+                    // Add an emoji-only CSS format
+                    pMessage.classList.add('emoji-only');
+                } else {
+                    // Render their text content (using our custom Markdown renderer)
+                    // NOTE: the input IS HTML-sanitised, however, heavy auditing of the sanitisation method should be done, it is a bit sketchy
+                    pMessage.innerHTML = parseMarkdown(msg.content);
+                }
                 // Add it to the chat!
                 divMessage.appendChild(pMessage);
                 domChatMessages.appendChild(divMessage);
