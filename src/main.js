@@ -13,19 +13,133 @@ const domLoginInput = document.getElementById('login-input');
 const domLoginBtn = document.getElementById('login-btn');
 
 const domChats = document.getElementById('chats');
+const domAccount = document.getElementById('account');
 const domChatList = document.getElementById('chat-list');
 
 const domChat = document.getElementById('chat');
 const domChatBackBtn = document.getElementById('chat-back-btn');
 const domChatContact = document.getElementById('chat-contact');
+const domChatContactStatus = document.getElementById('chat-contact-status');
 const domChatMessages = document.getElementById('chat-messages');
 const domChatMessageBox = document.getElementById('chat-box');
 const domChatMessageInput = document.getElementById('chat-input');
+const domChatMessageInputEmoji = document.getElementById('chat-input-emoji');
 
 const domChatNew = document.getElementById('chat-new');
 const domChatNewBackBtn = document.getElementById('chat-new-back-btn');
 const domChatNewInput = document.getElementById('chat-new-input');
 const domChatNewStartBtn = document.getElementById('chat-new-btn');
+
+document.addEventListener('DOMContentLoaded', () => {
+    const picker = document.querySelector('.emoji-picker');
+    /** @type {HTMLInputElement} */
+    const emojiSearch = document.getElementById('emoji-search-input');
+    const emojiResults = document.getElementById('emoji-results');
+
+    // Listen for Emoji Picker interactions
+    document.addEventListener('click', (e) => {
+        if (e.target === domChatMessageInputEmoji && !picker.classList.contains('active')) {
+            // Render our most used emojis by default
+            let nDisplayedEmojis = 0;
+            emojiResults.innerHTML = ``;
+            for (const cEmoji of getMostUsedEmojis()) {
+                // Only display 8
+                if (nDisplayedEmojis >= 8) break;
+                // Push it in to the results
+                const spanEmoji = document.createElement('span');
+                spanEmoji.textContent = cEmoji.emoji;
+                emojiResults.appendChild(spanEmoji);
+                nDisplayedEmojis++;
+            }
+
+            // Setup the picker UI
+            const rect = domChatMessageBox.getBoundingClientRect();
+            picker.style.right = `0px`;
+
+            // TODO: find out why the `-5px` is needed here... hidden margin? padding?
+            picker.style.bottom = `${rect.height - 5}px`;
+            picker.classList.add('active');
+
+            // Focus on the emoji search box for easy searching
+            emojiSearch.focus();
+        } else {
+            // Hide and reset the UI
+            emojiSearch.value = '';
+            picker.classList.remove('active');
+        }
+    });
+
+    // Listen for emoji searches
+    emojiSearch.addEventListener('input', (e) => {
+        // Search for the requested emojis and render them, if it's empty, just use our favorites
+        let nDisplayedEmojis = 0;
+        emojiResults.innerHTML = ``;
+        for (const cEmoji of emojiSearch.value ? searchEmojis(emojiSearch.value) : getMostUsedEmojis()) {
+            // Only display 8
+            if (nDisplayedEmojis >= 8) break;
+            // Push it in to the results
+            const spanEmoji = document.createElement('span');
+            spanEmoji.textContent = cEmoji.emoji;
+            // In searches; the first emoji gets a special tag denoting 'Enter' key selection
+            if (emojiSearch.value) {
+                if (nDisplayedEmojis === 0) {
+                    spanEmoji.id = 'first-emoji';
+                    spanEmoji.style.opacity = 1;
+                } else {
+                    spanEmoji.style.opacity = 0.75;
+                }
+            }
+            emojiResults.appendChild(spanEmoji);
+            nDisplayedEmojis++;
+        }
+
+        // If there's none, sad!
+        if (nDisplayedEmojis === 0) {
+            emojiResults.textContent = `No emojis found`;
+        }
+    });
+
+    // When hitting Enter on the emoji search - choose the first emoji
+    emojiSearch.onkeydown = async (e) => {
+        if (e.code === 'Enter') {
+            e.preventDefault();
+
+            // Register the selection in the emoji-dex
+            const domFirstEmoji = document.getElementById('first-emoji');
+            const cEmoji = arrEmojis.find(a => a.emoji === domFirstEmoji.textContent);
+            cEmoji.used++;
+
+            // Add it to the message input
+            domChatMessageInput.value += cEmoji.emoji;
+
+            // Reset the UI state
+            emojiSearch.value = '';
+            picker.classList.remove('active');
+
+            // Bring the focus back to the chat
+            domChatMessageInput.focus();
+        }
+    };
+
+    // Emoji selection
+    picker.addEventListener('click', (e) => {
+        if (e.target.tagName === 'SPAN') {
+            // Register the click in the emoji-dex
+            const cEmoji = arrEmojis.find(a => a.emoji === e.target.textContent);
+            cEmoji.used++;
+
+            // Add it to the message input
+            domChatMessageInput.value += cEmoji.emoji;
+
+            // Reset the UI state
+            emojiSearch.value = '';
+            picker.classList.remove('active');
+
+            // Bring the focus back to the chat
+            domChatMessageInput.focus();
+        }
+    });
+});
 
 /**
  * @typedef {Object} Message
@@ -169,11 +283,37 @@ async function message(pubkey, content) {
  * Login to the Nostr network
  */
 async function login() {
-    const fLoggedIn = await invoke("login", { importKey: domLoginInput.value.trim() });
-    if (fLoggedIn) {
+    const strPubkey = await invoke("login", { importKey: domLoginInput.value.trim() });
+    if (strPubkey) {
         // Hide the login UI
         domLoginInput.value = "";
         domLogin.style.display = 'none';
+
+        // Connect to Nostr
+        domChatList.textContent = `Connecting to Nostr...`;
+        await invoke("connect");
+
+        // Attempt to sync our profile data
+        domChatList.textContent = `Syncing your profile...`;
+        let cProfile;
+        try {
+            cProfile = await invoke("load_profile", { npub: strPubkey });
+            arrProfiles.push(cProfile);
+        } catch (e) {
+            arrProfiles.push({ id: strPubkey, name: '', avatar: '', mine: true });
+        }
+
+        // Render our avatar (if we have one)
+        if (cProfile?.avatar) {
+            const imgAvatar = document.createElement('img');
+            imgAvatar.src = cProfile.avatar;
+            domAccount.appendChild(imgAvatar);
+        }
+
+        // Render our username (or npub)
+        const h3Username = document.createElement('h3');
+        h3Username.textContent = cProfile?.name || strPubkey.substring(0, 10) + '…';
+        domAccount.appendChild(h3Username);
 
         // Connect and fetch historical messages
         await fetchMessages(true);
@@ -230,36 +370,62 @@ function updateChat(contact) {
         // Prefer displaying their name, otherwise, npub
         domChatContact.textContent = cProfile?.name || contact.substring(0, 10) + '…';
 
-        // Render their messages
-        const arrMessages = cContact.contents;
-        domChatMessages.innerHTML = ``;
-        for (const msg of arrMessages) {
-            // Construct the message container
-            const divMessage = document.createElement('div');
-            // Render it appropriately depending on who sent it
-            divMessage.classList.add('msg-' + (msg.mine ? 'me' : 'them'));
-            // Render their avatar, if they have one
-            if (!msg.mine && cProfile?.avatar) {
-                const imgAvatar = document.createElement('img');
-                imgAvatar.src = cProfile.avatar;
-                divMessage.appendChild(imgAvatar);
-            }
-            // Construct the text content
-            const pMessage = document.createElement('p');
-            // Render their text content
-            pMessage.textContent = msg.content;
-            // Add it to the chat!
-            divMessage.appendChild(pMessage);
-            domChatMessages.appendChild(divMessage);
+        // Display their status, if one exists
+        const fHasStatus = !!cProfile?.status?.title;
+        domChatContactStatus.textContent = cProfile?.status?.title || '';
+
+        // Adjust our Contact Name class to manage space according to Status visibility
+        if (fHasStatus) {
+            domChatContact.classList.remove('chat-contact');
+            domChatContact.classList.add('chat-contact-with-status');
+        } else {
+            domChatContact.classList.add('chat-contact');
+            domChatContact.classList.remove('chat-contact-with-status');
         }
 
-        // Auto-scroll on new messages (not a great implementation)
-        if (arrMessages.length) {
-            const cLastMsg = arrMessages[arrMessages.length - 1];
-            if (strLastMsgID !== cLastMsg.id) {
-                domChatMessages.scrollTo(0, domChatMessages.scrollHeight);
-                strLastMsgID = cLastMsg.id;
+        // Render their messages if a new one has been added
+        // TODO: this needs rewriting in the future to be event-based, i.e: new message added (append), message edited (modify one message in the DOM), etc.
+        const arrMessages = cContact.contents;
+        const cLastMsg = arrMessages[arrMessages.length - 1];
+        const isNewMsg = strLastMsgID !== cLastMsg.id;
+        if (isNewMsg) {
+            // Update the last message ID
+            strLastMsgID = cLastMsg.id
+
+            // Wipe and re-render the HTML
+            domChatMessages.innerHTML = ``;
+            let nLastMsgTime = arrMessages[0]?.at || 0;
+            for (const msg of arrMessages) {
+                // If the last message was over 10 minutes ago, add an inline timestamp
+                if (msg.at - nLastMsgTime > 600) {
+                    nLastMsgTime = msg.at;
+                    const pTimestamp = document.createElement('p');
+                    pTimestamp.classList.add('msg-inline-timestamp');
+                    pTimestamp.textContent = (new Date(msg.at * 1000)).toLocaleString();
+                    domChatMessages.appendChild(pTimestamp);
+                }
+                // Construct the message container
+                const divMessage = document.createElement('div');
+                // Render it appropriately depending on who sent it
+                divMessage.classList.add('msg-' + (msg.mine ? 'me' : 'them'));
+                // Render their avatar, if they have one
+                if (!msg.mine && cProfile?.avatar) {
+                    const imgAvatar = document.createElement('img');
+                    imgAvatar.src = cProfile.avatar;
+                    divMessage.appendChild(imgAvatar);
+                }
+                // Construct the text content
+                const pMessage = document.createElement('p');
+                // Render their text content (using our custom Markdown renderer)
+                // NOTE: the input IS HTML-sanitised, however, heavy auditing of the sanitisation method should be done, it is a bit sketchy
+                pMessage.innerHTML = parseMarkdown(msg.content);
+                // Add it to the chat!
+                divMessage.appendChild(pMessage);
+                domChatMessages.appendChild(divMessage);
             }
+
+            // Auto-scroll on new messages
+            domChatMessages.scrollTo(0, domChatMessages.scrollHeight);
         }
     } else {
         // Probably a 'New Chat', as such, we'll mostly render an empty chat
@@ -290,11 +456,12 @@ window.addEventListener("DOMContentLoaded", () => {
         domChatNewInput.value = ``;
     };
 
-    // Hook up an 'Enter' listener on the Message Box for sending them
+    // Hook up an 'Enter' listener on the Message Box for sending messages
     domChatMessageInput.onkeydown = async (evt) => {
-        if (evt.code === 'Enter' && domChatMessageInput.value.trim().length) {
+        if (evt.code === 'Enter' && !evt.shiftKey && domChatMessageInput.value.trim().length) {
+            evt.preventDefault();
             await message(strOpenChat, domChatMessageInput.value);
             domChatMessageInput.value = '';
         }
-    }
+    };
 });

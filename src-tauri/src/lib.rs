@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use tokio::sync::Mutex;
 
 use nostr_sdk::prelude::*;
 use once_cell::sync::OnceCell;
@@ -20,6 +20,15 @@ struct Profile {
     id: String,
     name: String,
     avatar: String,
+    status: Status,
+    mine: bool,
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+struct Status {
+    title: String,
+    purpose: String,
+    url: String,
 }
 
 struct ChatState {
@@ -55,61 +64,65 @@ lazy_static! {
 async fn fetch_messages() -> Result<Vec<Message>, ()> {
     let client = NOSTR_CLIENT.get().expect("Nostr client not initialized");
 
-    // If we're not connected to any relays - connect and immediately retrieve our historical messages
-    if client.relays().await.len() == 0 {
-        connect().await;
-
+    // If we don't have any messages - keep trying to find 'em
+    let mut state = STATE.lock().await;
+    if state.messages.is_empty() {
         // Grab our pubkey
         let signer = client.signer().await.unwrap();
-        let pubkey = signer.get_public_key().await.unwrap();
+        let my_public_key = signer.get_public_key().await.unwrap();
 
         // Fetch GiftWraps related to us
-        let filter = Filter::new().pubkey(pubkey).kind(Kind::GiftWrap);
+        let filter = Filter::new().pubkey(my_public_key).kind(Kind::GiftWrap);
         let events = client
             .fetch_events(vec![filter], std::time::Duration::from_secs(10))
-            .await.unwrap();
+            .await
+            .unwrap();
 
         // Decrypt every GiftWrap and return their contents + senders
-        for maybe_dm in events.iter() {
-            if maybe_dm.kind == Kind::GiftWrap {
-                match client.unwrap_gift_wrap(&maybe_dm).await {
-                    Ok(UnwrappedGift { rumor, sender }) => {
-                        // Found a NIP-17 message!
-                        if rumor.kind == Kind::PrivateDirectMessage {
-                            let is_mine = sender == pubkey;
-                            // TODO: simplify and un-nest-ify this ugly section
-                            match rumor.tags.first() {
-                                Some(tag) => {
-                                    match tag.content() {
-                                        Some(content) => {
-                                            match PublicKey::from_hex(content) {
-                                                Ok(pub_key) => {
-                                                    match pub_key.to_bech32() {
-                                                        Ok(bech32) => {
-                                                            let msg = Message{ id: rumor.id.unwrap().to_bech32().unwrap(), content: rumor.content.to_string(), contact: if sender == pubkey { bech32 } else { sender.to_bech32().unwrap() }, at: rumor.created_at.as_u64(), mine: is_mine };
-                                                            let mut state = STATE.lock().unwrap();
-                                                            state.add_message(msg);
-                                                        },
-                                                        Err(_) => eprintln!("Failed to convert public key to bech32"),
-                                                    }
-                                                },
-                                                Err(_) => eprintln!("Failed to create public key from hex"),
-                                            }
-                                        },
-                                        None => eprintln!("No tag content"),
+        for maybe_dm in events.into_iter().filter(|e| e.kind == Kind::GiftWrap) {
+            // Unwrap the gift wrap
+            match client.unwrap_gift_wrap(&maybe_dm).await {
+                Ok(UnwrappedGift { rumor, sender }) => {
+                    // Found a NIP-17 message!
+                    if rumor.kind == Kind::PrivateDirectMessage {
+                        // Check if it's mine
+                        let is_mine = sender == my_public_key;
+
+                        // Get contact public key (bech32)
+                        let contact: String = if is_mine {
+                            // Get first public key from tags
+                            match rumor.tags.public_keys().next() {
+                                Some(pub_key) => match pub_key.to_bech32() {
+                                    Ok(p_tag_pubkey_bech32) => p_tag_pubkey_bech32,
+                                    Err(..) => {
+                                        eprintln!("Failed to convert public key to bech32");
+                                        continue;
                                     }
                                 },
-                                None => eprintln!("No tags found"),
-                            }                            
-                        }
+                                None => {
+                                    eprintln!("Public key tag found");
+                                    continue;
+                                }
+                            }
+                        } else {
+                            sender.to_bech32().unwrap()
+                        };
+
+                        let msg = Message {
+                            id: rumor.id.unwrap().to_bech32().unwrap(),
+                            content: rumor.content,
+                            contact,
+                            at: rumor.created_at.as_u64(),
+                            mine: is_mine,
+                        };
+                        state.add_message(msg);
                     }
-                    Err(_e) => (),
                 }
+                Err(_e) => (),
             }
         }
     }
 
-    let state = STATE.lock().unwrap();
     let msgs = state.messages.clone();
 
     Ok(msgs)
@@ -119,14 +132,24 @@ async fn fetch_messages() -> Result<Vec<Message>, ()> {
 async fn message(receiver: String, content: String) -> Result<bool, ()> {
     let client = NOSTR_CLIENT.get().expect("Nostr client not initialized");
 
+    // Grab our pubkey
+    let signer = client.signer().await.unwrap();
+    let my_public_key = signer.get_public_key().await.unwrap();
+
     // Convert the Bech32 String in to a PublicKey
     let receiver_pubkey = PublicKey::from_bech32(receiver.as_str()).unwrap();
 
-    // Attempt to send the message
-    match client.send_private_msg(receiver_pubkey, content.clone(), []).await {
+    // Build the NIP-17 rumor
+    let rumor = EventBuilder::private_msg_rumor(receiver_pubkey, content.clone());
+
+    // Send message to the real receiver
+    client.gift_wrap(&receiver_pubkey, rumor.clone(), []).await.unwrap();
+
+    // Send message to our own public key, to allow for message recovering
+    match client.gift_wrap(&my_public_key, rumor, []).await {
         Ok(response) => {
             let msg = Message{ id: response.id().to_bech32().unwrap(), content: content, contact: receiver, at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(), mine: true };
-            let mut state = STATE.lock().unwrap();
+            let mut state = STATE.lock().await;
             state.add_message(msg);
             return Ok(true);
         },
@@ -144,11 +167,36 @@ async fn load_profile(npub: String) -> Result<Profile, ()> {
     // Convert the Bech32 String in to a PublicKey
     let profile_pubkey = PublicKey::from_bech32(npub.as_str()).unwrap();
 
+    // Grab our pubkey to check for profiles belonging to us
+    let signer = client.signer().await.unwrap();
+    let my_public_key = signer.get_public_key().await.unwrap();
+
+    // Attempt to fetch their status, if one exists
+    let status_filter = Filter::new().author(profile_pubkey).kind(Kind::from_u16(30315)).limit(1);
+    let status = match client.fetch_events(vec![status_filter], std::time::Duration::from_secs(10)).await {
+        Ok(res) => {
+            // Make sure they have a status available
+            if !res.is_empty() {
+                let status_event = res.first().unwrap();
+                // Simple status recognition: last, general-only, no URLs, Metadata or Expiry considered
+                // TODO: comply with expiries, accept more "d" types, allow URLs
+                Status { title: status_event.content.clone(), purpose: status_event.tags.first().unwrap().content().unwrap().to_string(), url: String::from("") }
+            } else {
+                // No status
+                Status { title: String::from(""), purpose: String::from(""), url: String::from("") }
+            }
+        },
+        Err(_e) => {
+            Status { title: String::from(""), purpose: String::from(""), url: String::from("") }
+        },
+    };
+
     // Attempt to fetch their Metadata profile
     match client.fetch_metadata(profile_pubkey, std::time::Duration::from_secs(10)).await {
         Ok(response) => {
-            let profile = Profile{ id: npub, name: response.name.unwrap_or_default(), avatar: response.picture.unwrap_or_default() };
-            let mut state = STATE.lock().unwrap();
+            let mine = my_public_key == profile_pubkey;
+            let profile = Profile { mine, id: npub, name: response.name.unwrap_or_default(), avatar: response.picture.unwrap_or_default(), status };
+            let mut state = STATE.lock().await;
             state.add_profile(profile.clone());
             return Ok(profile);
         },
@@ -180,7 +228,7 @@ async fn notifs() {
                         Ok(UnwrappedGift { rumor, sender }) => {
                             if rumor.kind == Kind::PrivateDirectMessage {
                                 let msg = Message{ id: rumor.id.unwrap().to_bech32().unwrap(), content: rumor.content.to_string(), contact: sender.to_bech32().unwrap().to_string(), at: rumor.created_at.as_u64(), mine: pubkey == rumor.pubkey };
-                                let mut state = STATE.lock().unwrap();
+                                let mut state = STATE.lock().await;
                                 state.add_message(msg);
                             }
                         }
@@ -194,7 +242,7 @@ async fn notifs() {
 }
 
 #[tauri::command]
-async fn login(import_key: String) -> Result<bool, ()> {
+async fn login(import_key: String) -> Result<String, ()> {
     let keys: Keys;
     // TODO: add validation, error handling, etc
 
@@ -212,13 +260,17 @@ async fn login(import_key: String) -> Result<bool, ()> {
         .opts(Options::new().gossip(false))
         .build();
     NOSTR_CLIENT.set(client).unwrap();
-    Ok(true)
+
+    // Return our npub to the frontend client
+    Ok(keys.public_key.to_bech32().unwrap())
 }
 
+#[tauri::command]
 async fn connect() {
     let client = NOSTR_CLIENT.get().expect("Nostr client not initialized");
 
-    // Add a couple common relays, especially with explicit NIP-17 support (thanks 0xchat!)
+    // Add a couple common relays, especially with explicit NIP-17 support (thanks 0xchat and myself!)
+    client.add_relay("wss://jskitty.cat/nostr").await.unwrap();
     client.add_relay("wss://relay.0xchat.com").await.unwrap();
     client.add_relay("wss://auth.nostr1.com").await.unwrap();
     client.add_relay("wss://relay.damus.io").await.unwrap();
@@ -231,7 +283,7 @@ async fn connect() {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![fetch_messages, message, login, notifs, load_profile])
+        .invoke_handler(tauri::generate_handler![fetch_messages, message, login, notifs, load_profile, connect])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
