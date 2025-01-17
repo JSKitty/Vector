@@ -1,8 +1,11 @@
+use rand::Rng;
+use argon2::{Argon2, Params, Version};
 use tokio::sync::Mutex;
-
+use chacha20::ChaCha20;
+use chacha20::cipher::{KeyIvInit, StreamCipher};
+use lazy_static::lazy_static;
 use nostr_sdk::prelude::*;
 use once_cell::sync::OnceCell;
-use lazy_static::lazy_static;
 
 use tauri::{AppHandle, Manager};
 use tauri_plugin_notification::NotificationExt;
@@ -56,7 +59,11 @@ struct ChatState {
 
 impl ChatState {
     fn new() -> Self {
-        Self { messages: Vec::new(), profiles: Vec::new(), has_state_changed: true }
+        Self {
+            messages: Vec::new(),
+            profiles: Vec::new(),
+            has_state_changed: true,
+        }
     }
 
     fn add_message(&mut self, message: Message) {
@@ -161,7 +168,7 @@ async fn fetch_messages() -> Result<Vec<Message>, ()> {
                                             id: rumor.id.unwrap().to_hex(),
                                             reference_id: reference_id.to_string(),
                                             author_id: sender.to_hex(),
-                                            emoji: rumor.content.clone()
+                                            emoji: rumor.content.clone(),
                                         };
                                         // Append it to the message
                                         msg.add_reaction(reaction);
@@ -171,7 +178,7 @@ async fn fetch_messages() -> Result<Vec<Message>, ()> {
 
                                 // If we found the relevent message: mark the state as changed!
                                 state.has_state_changed = found_message;
-                            },
+                            }
                             None => println!("No referenced message for reaction"),
                         }
                     }
@@ -187,7 +194,7 @@ async fn fetch_messages() -> Result<Vec<Message>, ()> {
 }
 
 #[tauri::command]
-async fn message(receiver: String, content: String) -> Result<bool, ()> {
+async fn message(receiver: String, content: String) -> Result<bool, String> {
     let client = NOSTR_CLIENT.get().expect("Nostr client not initialized");
 
     // Grab our pubkey
@@ -201,7 +208,10 @@ async fn message(receiver: String, content: String) -> Result<bool, ()> {
     let rumor = EventBuilder::private_msg_rumor(receiver_pubkey, content.clone());
 
     // Send message to the real receiver
-    client.gift_wrap(&receiver_pubkey, rumor.clone(), []).await.unwrap();
+    match client.gift_wrap(&receiver_pubkey, rumor.clone(), []).await {
+        Ok(_) => ( /* Good! Nothing to do */ ),
+        Err(e) => return Err(e.to_string())
+    }
 
     // Send message to our own public key, to allow for message recovering
     match client.gift_wrap(&my_public_key, rumor, []).await {
@@ -210,19 +220,21 @@ async fn message(receiver: String, content: String) -> Result<bool, ()> {
                 id: response.id().to_hex(),
                 content: content,
                 contact: receiver,
-                at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
                 reactions: Vec::new(),
-                mine: true
+                mine: true,
             };
             let mut state = STATE.lock().await;
             state.has_state_changed = true;
             state.add_message(msg);
             return Ok(true);
-        },
+        }
         Err(e) => {
-            eprintln!("Error: {:?}", e);
-            return Ok(false);
-        },
+            return Err(e.to_string())
+        }
     }
 }
 
@@ -244,10 +256,18 @@ async fn react(reference_id: String, chat_pubkey: String, emoji: String) -> Resu
         let my_public_key = signer.get_public_key().await.unwrap();
 
         // Build our NIP-25 Reaction rumor
-        let rumor = EventBuilder::reaction_extended(reference_event, receiver_pubkey, Some(Kind::PrivateDirectMessage), emoji.clone());
+        let rumor = EventBuilder::reaction_extended(
+            reference_event,
+            receiver_pubkey,
+            Some(Kind::PrivateDirectMessage),
+            emoji.clone(),
+        );
 
         // Send reaction to the real receiver
-        client.gift_wrap(&receiver_pubkey, rumor.clone(), []).await.unwrap();
+        client
+            .gift_wrap(&receiver_pubkey, rumor.clone(), [])
+            .await
+            .unwrap();
 
         // Send reaction to our own public key, to allow for recovering
         match client.gift_wrap(&my_public_key, rumor, []).await {
@@ -257,17 +277,17 @@ async fn react(reference_id: String, chat_pubkey: String, emoji: String) -> Resu
                     id: response.id().to_hex(),
                     reference_id,
                     author_id: my_public_key.to_hex(),
-                    emoji
+                    emoji,
                 };
                 // Append it to the message
                 msg.add_reaction(reaction);
                 state.has_state_changed = true;
                 return Ok(true);
-            },
+            }
             Err(e) => {
                 eprintln!("Error: {:?}", e);
                 return Ok(false);
-            },
+            }
         }
     } else {
         //  No reference message, what do!?
@@ -287,39 +307,70 @@ async fn load_profile(npub: String) -> Result<Profile, ()> {
     let my_public_key = signer.get_public_key().await.unwrap();
 
     // Attempt to fetch their status, if one exists
-    let status_filter = Filter::new().author(profile_pubkey).kind(Kind::from_u16(30315)).limit(1);
-    let status = match client.fetch_events(vec![status_filter], std::time::Duration::from_secs(10)).await {
+    let status_filter = Filter::new()
+        .author(profile_pubkey)
+        .kind(Kind::from_u16(30315))
+        .limit(1);
+    let status = match client
+        .fetch_events(vec![status_filter], std::time::Duration::from_secs(10))
+        .await
+    {
         Ok(res) => {
             // Make sure they have a status available
             if !res.is_empty() {
                 let status_event = res.first().unwrap();
                 // Simple status recognition: last, general-only, no URLs, Metadata or Expiry considered
                 // TODO: comply with expiries, accept more "d" types, allow URLs
-                Status { title: status_event.content.clone(), purpose: status_event.tags.first().unwrap().content().unwrap().to_string(), url: String::from("") }
+                Status {
+                    title: status_event.content.clone(),
+                    purpose: status_event
+                        .tags
+                        .first()
+                        .unwrap()
+                        .content()
+                        .unwrap()
+                        .to_string(),
+                    url: String::from(""),
+                }
             } else {
                 // No status
-                Status { title: String::from(""), purpose: String::from(""), url: String::from("") }
+                Status {
+                    title: String::from(""),
+                    purpose: String::from(""),
+                    url: String::from(""),
+                }
             }
-        },
-        Err(_e) => {
-            Status { title: String::from(""), purpose: String::from(""), url: String::from("") }
+        }
+        Err(_e) => Status {
+            title: String::from(""),
+            purpose: String::from(""),
+            url: String::from(""),
         },
     };
 
     // Attempt to fetch their Metadata profile
-    match client.fetch_metadata(profile_pubkey, std::time::Duration::from_secs(10)).await {
+    match client
+        .fetch_metadata(profile_pubkey, std::time::Duration::from_secs(10))
+        .await
+    {
         Ok(response) => {
             let mine = my_public_key == profile_pubkey;
-            let profile = Profile { mine, id: npub, name: response.name.unwrap_or_default(), avatar: response.picture.unwrap_or_default(), status };
+            let profile = Profile {
+                mine,
+                id: npub,
+                name: response.name.unwrap_or_default(),
+                avatar: response.picture.unwrap_or_default(),
+                status,
+            };
             let mut state = STATE.lock().await;
             state.has_state_changed = true;
             state.add_profile(profile.clone());
             return Ok(profile);
-        },
+        }
         Err(e) => {
             eprintln!("Error: {:?}", e);
             return Err(());
-        },
+        }
     }
 }
 
@@ -350,17 +401,27 @@ async fn notifs() {
                                     contact: sender.to_bech32().unwrap().to_string(),
                                     at: rumor.created_at.as_u64(),
                                     reactions: Vec::new(),
-                                    mine: pubkey == rumor.pubkey
+                                    mine: pubkey == rumor.pubkey,
                                 };
                                 let mut state = STATE.lock().await;
 
                                 // Send an OS notification for incoming messages
                                 if !msg.mine {
                                     // Find the name of the sender, if we have it
-                                    if let Some(profile) = state.profiles.iter().find(|profile| profile.id == msg.contact) {
-                                        show_notification(profile.name.clone(), msg.content.clone());
+                                    if let Some(profile) = state
+                                        .profiles
+                                        .iter()
+                                        .find(|profile| profile.id == msg.contact)
+                                    {
+                                        show_notification(
+                                            profile.name.clone(),
+                                            msg.content.clone(),
+                                        );
                                     } else {
-                                        show_notification(String::from("New Message"), msg.content.clone());
+                                        show_notification(
+                                            String::from("New Message"),
+                                            msg.content.clone(),
+                                        );
                                     }
                                 }
 
@@ -385,7 +446,7 @@ async fn notifs() {
                                                     id: rumor.id.unwrap().to_hex(),
                                                     reference_id: reference_id.to_string(),
                                                     author_id: sender.to_hex(),
-                                                    emoji: rumor.content.clone()
+                                                    emoji: rumor.content.clone(),
                                                 };
                                                 // Append it to the message
                                                 msg.add_reaction(reaction);
@@ -395,7 +456,7 @@ async fn notifs() {
 
                                         // If we found the relevent message: mark the state as changed!
                                         state.has_state_changed = found_message;
-                                    },
+                                    }
                                     None => println!("No referenced message for reaction"),
                                 }
                             }
@@ -406,7 +467,8 @@ async fn notifs() {
             }
             Ok(false)
         })
-        .await.unwrap();
+        .await
+        .unwrap();
 }
 
 #[tauri::command]
@@ -414,8 +476,17 @@ fn show_notification(title: String, content: String) {
     let app_handle = TAURI_APP.get().unwrap().clone();
     // Only send notifications if the app is not focused
     // TODO: generalise this assumption - it's only used for Message Notifications at the moment
-    if !app_handle.webview_windows().iter().next().unwrap().1.is_focused().unwrap() {
-        app_handle.notification()
+    if !app_handle
+        .webview_windows()
+        .iter()
+        .next()
+        .unwrap()
+        .1
+        .is_focused()
+        .unwrap()
+    {
+        app_handle
+            .notification()
             .builder()
             .title(title)
             .body(content)
@@ -424,8 +495,14 @@ fn show_notification(title: String, content: String) {
     }
 }
 
+#[derive(serde::Serialize, Clone)]
+struct LoginKeyPair {
+    public: String,
+    private: String,
+}
+
 #[tauri::command]
-async fn login(import_key: String) -> Result<String, ()> {
+async fn login(import_key: String) -> Result<LoginKeyPair, ()> {
     let keys: Keys;
     // TODO: add validation, error handling, etc
 
@@ -445,7 +522,7 @@ async fn login(import_key: String) -> Result<String, ()> {
     NOSTR_CLIENT.set(client).unwrap();
 
     // Return our npub to the frontend client
-    Ok(keys.public_key.to_bech32().unwrap())
+    Ok( LoginKeyPair { public: keys.public_key.to_bech32().unwrap(), private: keys.secret_key().to_bech32().unwrap()} )
 }
 
 #[tauri::command]
@@ -474,18 +551,116 @@ async fn connect() {
     client.connect().await;
 }
 
+// Convert string to bytes, ensuring we're dealing with the raw content
+fn string_to_bytes(s: &str) -> Vec<u8> {
+    s.as_bytes().to_vec()
+}
+
+// Convert bytes to string, but we'll use hex encoding for encrypted data
+fn bytes_to_hex_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+// Convert hex string back to bytes for decryption
+fn hex_string_to_bytes(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i+2], 16).unwrap())
+        .collect()
+}
+
+async fn hash_pass(password: String) -> [u8; 32] {
+    // 75000 KiB memory size
+    let memory = 75000;
+    // 5 iterations
+    let iterations = 5;
+    let params = Params::new(memory, iterations, 1, Some(32)).unwrap();
+
+    // TODO: create a random on-disk salt at first init
+    // However, with the nature of this being local software, it won't help a user whom has their system compromised in the first place
+    let salt = "vectorvectovectvecvev".as_bytes();
+
+    // Prepare derivation
+    let argon = Argon2::new(argon2::Algorithm::Argon2id, Version::V0x13, params);
+    let mut key: [u8; 32] = [0; 32];
+    argon
+        .hash_password_into(password.as_bytes(), salt, &mut key)
+        .unwrap();
+
+    key
+}
+
+// Encrypt an Input with ChaCha20 and password-derived Argon2 key
+// Output format: <12-byte-rand-nonce><encrypted-payload>
+#[tauri::command]
+async fn encrypt(input: String, password: String) -> String {
+    // Hash our password with ramped-up Argon2 and use it as the key
+    let key = hash_pass(password).await;
+
+    // Generate a nonce
+    let mut rng = rand::thread_rng();
+    let nonce: [u8; 12] = rng.gen();
+
+    // Prepend the nonce to our cipher output
+    let mut buffer: Vec<u8> = nonce.to_vec();
+
+    // Encrypt the input
+    let mut cipher = ChaCha20::new(&key.into(), &nonce.into());
+    let mut cipher_buffer = string_to_bytes(&input);
+    cipher.apply_keystream(&mut cipher_buffer);
+
+    // Append the cipher buffer
+    buffer.append(&mut cipher_buffer);
+
+    // Convert the encrypted bytes to a hex string for safe storage/transmission
+    bytes_to_hex_string(&buffer)
+}
+
+#[tauri::command]
+async fn decrypt(ciphertext: String, password: String) -> Result<String, ()> {
+    // Hash our password with ramped-up Argon2 and use it as the key
+    let key = hash_pass(password).await;
+
+    // Prepare our decryption buffer split it away from our prepended nonce
+    let mut nonce = hex_string_to_bytes(&ciphertext);
+    let mut buffer = nonce.split_off(12);
+
+    // Decrypt
+    let mut cipher = ChaCha20::new(&key.into(), nonce.as_slice().into());
+    cipher.apply_keystream(&mut buffer);
+
+    // Convert decrypted bytes back to string
+    match String::from_utf8(buffer) {
+        Ok(decrypted) => Ok(decrypted),
+        Err(_) => Err(())
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_store::Builder::new().build())
         .setup(|app| {
             let app_handle = app.app_handle().clone();
             // Set as our accessible static app handle
             TAURI_APP.set(app_handle).unwrap();
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![fetch_messages, message, react, login, notifs, load_profile, connect, has_state_changed, acknowledge_state_change])
+        .invoke_handler(tauri::generate_handler![
+            fetch_messages,
+            message,
+            react,
+            login,
+            notifs,
+            load_profile,
+            connect,
+            has_state_changed,
+            acknowledge_state_change,
+            encrypt,
+            decrypt
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

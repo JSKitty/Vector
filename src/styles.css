@@ -53,6 +53,12 @@ body {
   margin-top: 10px;
 }
 
+.pin-row input {
+  text-align: center;
+  width: 10px;
+  margin: 5px;
+}
+
 .account {
   align-items: center;
 }
@@ -164,7 +170,8 @@ body {
   align-items: flex-end;
   overflow-y: scroll;
   background-color: #040308;
-  height: 462px;
+  /* An imperfect solution attempting to fit the message list within it's Chat Box proportionately to the window height */
+  height: calc(100% - 80px);
   padding-left: 10px;
   padding-right: 10px;
   border-top-style: solid;
@@ -218,6 +225,7 @@ body {
   padding-left: 0;
   margin-top: 25px;
   margin-bottom: 25px;
+  line-height: 75px;
 }
 
 .msg-them {
@@ -232,6 +240,13 @@ body {
   transition: opacity 0.1s;
 }
 
+.reaction {
+  cursor: default;
+  position: relative;
+  height: fit-content;
+  width: fit-content;
+}
+
 .msg-them:hover .add-reaction  {
   opacity: 0.75;
 }
@@ -240,6 +255,8 @@ body {
   width: 100%;
   background-color: #251134ff;
   height: 55px;
+  position: absolute;
+  bottom: 0;
 }
 
 #chat-input {
@@ -317,6 +334,12 @@ a:hover {
 
 h1 {
   text-align: center;
+}
+
+input[type=number]::-webkit-outer-spin-button,
+input[type=number]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
 }
 
 input,

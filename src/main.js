@@ -9,8 +9,13 @@ getVersion().then(v => {
 });
 
 const domLogin = document.getElementById('login-form');
+const domLoginImport = document.getElementById('login-import');
 const domLoginInput = document.getElementById('login-input');
 const domLoginBtn = document.getElementById('login-btn');
+
+const domLoginEncrypt = document.getElementById('login-encrypt');
+const domLoginEncryptTitle = document.getElementById('login-encrypt-title');
+const domLoginEncryptPinRow = document.getElementById('login-encrypt-pins');
 
 const domChats = document.getElementById('chats');
 const domAccount = document.getElementById('account');
@@ -72,7 +77,7 @@ function openEmojiPanel(e) {
 
         // Setup the picker UI
         /** @type {DOMRect} */
-        const rect = (isDefaultPanel ? domChatMessageBox : e.target).getBoundingClientRect();
+        const rect = (isDefaultPanel ? domChatContact : e.target).getBoundingClientRect();
 
         // Display and stick it to the right side
         picker.style.display = `block`;
@@ -81,11 +86,14 @@ function openEmojiPanel(e) {
         // Compute it's position based on the element calling it (i.e: reactions are a floaty panel)
         const pickerRect = picker.getBoundingClientRect();
         if (isDefaultPanel) {
-            picker.style.top = `${document.body.clientHeight - pickerRect.height - rect.height + 5}px`
+            picker.style.top = `${document.body.clientHeight - pickerRect.height - rect.height}px`
             picker.classList.add('emoji-picker-message-type');
         } else {
             picker.classList.remove('emoji-picker-message-type');
-            picker.style.top = `${rect.y - rect.height + (pickerRect.height / 2) + 10}px`;
+            const fLargeMessage = rect.y < rect.height;
+            const yAxisTarget = fLargeMessage ? rect.y : rect.y - rect.height;
+            const yAxisCorrection = fLargeMessage ? 0 : pickerRect.height / 2;
+            picker.style.top = `${yAxisTarget + yAxisCorrection}px`;
             // TODO: this could be more intelligent (aim for the 'e.target' location)
             // ... however, you need to compute when the picker will overflow the app
             // ... and prevent it, so, I'm just glue-ing it to the right for now with
@@ -113,6 +121,8 @@ function openEmojiPanel(e) {
 
 // Listen for Emoji Picker interactions
 document.addEventListener('click', (e) => {
+    // If we're clicking the emoji search, don't close it!
+    if (e.target === emojiSearch) return;
     openEmojiPanel(e);
 });
 
@@ -168,8 +178,9 @@ emojiSearch.onkeydown = async (e) => {
 
                 // Add a 'decoy' reaction for good UX (no waiting for the network to register the reaction)
                 const spanReaction = document.createElement('span');
-                spanReaction.style.position = `relative`;
-                spanReaction.style.width = `60px`;
+                spanReaction.classList.add('reaction');
+                spanReaction.style.left = `-2px`;
+                spanReaction.style.bottom = `-2px`;
                 spanReaction.textContent = `${cEmoji.emoji} 1`;
 
                 // Remove the Reaction button
@@ -224,8 +235,9 @@ picker.addEventListener('click', (e) => {
 
                 // Add a 'decoy' reaction for good UX (no waiting for the network to register the reaction)
                 const spanReaction = document.createElement('span');
-                spanReaction.style.position = `relative`;
-                spanReaction.style.width = `60px`;
+                spanReaction.classList.add('reaction');
+                spanReaction.style.left = `-2px`;
+                spanReaction.style.bottom = `-2px`;
                 spanReaction.textContent = `${cEmoji.emoji} 1`;
 
                 // Remove the Reaction button
@@ -417,11 +429,11 @@ async function message(pubkey, content) {
  * Login to the Nostr network
  */
 async function login() {
-    const strPubkey = await invoke("login", { importKey: domLoginInput.value.trim() });
     if (strPubkey) {
-        // Hide the login UI
+        // Hide the login and encryption UI
         domLoginInput.value = "";
         domLogin.style.display = 'none';
+        domLoginEncrypt.style.display = 'none';
 
         // Connect to Nostr
         domChatList.textContent = `Connecting to Nostr...`;
@@ -461,6 +473,96 @@ async function login() {
 
         // Setup a subscription for new websocket messages
         invoke("notifs");
+    }
+}
+
+/**
+ * Display the Encryption/Decryption flow, depending on the passed options
+ * @param {string} pkey - A private key to encrypt
+ * @param {boolean} fUnlock - Whether we're unlocking an existing key, or encrypting the given one
+ */
+function openEncryptionFlow(pkey, fUnlock = false) {
+    domLoginImport.style.display = 'none';
+    domLoginEncrypt.style.display = '';
+
+    // Track our pin entries ('Current' is what the user has currently typed)
+    // ... while 'Last' holds a previous pin in memory for typo-checking purposes.
+    let strPinLast = [];
+    let strPinCurrent = Array(5).fill('-');
+
+    // If we're unlocking - display that
+    if (fUnlock) domLoginEncryptTitle.textContent = `Enter your Decryption Pin`;
+
+    // Track our pin inputs
+    const arrPinDOMs = document.querySelectorAll(`.pin-row input`);
+    arrPinDOMs.item(0).focus();
+    for (const domPin of arrPinDOMs) {
+        domPin.addEventListener('input', async function (e) {
+            this.value = this.value.replace(/[^0-9]/g, '');
+            if (this.value) {
+                // Find the index of this pin entry
+                const nIndex = Number(this.id.slice(-1));
+
+                // Focus the next entry
+                const domNextEntry = arrPinDOMs.item(nIndex + 1);
+                if (domNextEntry) domNextEntry.focus();
+                else arrPinDOMs.item(0).focus();
+
+                // Set the current digit entry
+                strPinCurrent[nIndex] = this.value;
+
+                // Figure out which Pin Array we're working with
+                if (strPinLast.length === 0) {
+                    // There's no set pin, so we're still setting the initial one
+                    // Check if we've filled this pin entry
+                    if (!strPinCurrent.includes(`-`)) {
+                        if (fUnlock) {
+                            // Attempt to decrypt our key with the pin
+                            domLoginEncryptTitle.textContent = `Decrypting your keys...`;
+                            domLoginEncryptPinRow.style.display = `none`;
+                            try {
+                                const decryptedPkey = await loadAndDecryptPrivateKey(strPinCurrent.join(''));
+                                const { public, _private } = await invoke("login", { importKey: decryptedPkey });
+                                strPubkey = public;
+                                login();
+                            } catch (e) {
+                                // Decrypt failed - let's re-try
+                                domLoginEncryptPinRow.style.display = ``;
+                                domLoginEncryptTitle.textContent = `Incorrect pin, try again`;
+                            }
+                        } else {
+                            // No more empty entries - let's reset for typo checking!
+                            strPinLast = [...strPinCurrent];
+                            domLoginEncryptTitle.textContent = `Re-enter your Pin`;
+                        }
+
+                        // Wipe the current digits
+                        for (const domPinToReset of arrPinDOMs) domPinToReset.value = ``;
+                        strPinCurrent = Array(5).fill('-');
+                    }
+                } else {
+                    // There's a pin set - let's make sure the re-type matches
+                    if (!strPinCurrent.includes(`-`)) {
+                        // Do they match?
+                        const fMatching = strPinLast.every((char, idx) => char === strPinCurrent[idx]);
+                        if (fMatching) {
+                            // Encrypt and proceed
+                            domLoginEncryptTitle.textContent = `Encrypting your keys...`;
+                            domLoginEncryptPinRow.style.display = `none`;
+                            await saveAndEncryptPrivateKey(pkey, strPinLast.join(''));
+                            login();
+                        } else {
+                            // Wrong pin! Let's start again
+                            domLoginEncryptTitle.textContent = `Pin doesn't match, re-try`;
+                            strPinCurrent = Array(5).fill(`-`);
+                            strPinLast = [];
+                        }
+                        // Reset the pin inputs
+                        for (const domPinToReset of arrPinDOMs) domPinToReset.value = ``;
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -565,8 +667,7 @@ function updateChat(contact) {
                 // Aggregate the 'reactions' of this reaction's type
                 const nReacts = msg.reactions.reduce((a, b) => b.emoji === cReaction.emoji ? a + 1 : a, 0);
                 spanReaction = document.createElement('span');
-                spanReaction.style.position = `relative`;
-                spanReaction.style.width = `60px`;
+                spanReaction.classList.add('reaction');
                 spanReaction.textContent = `${cReaction.emoji} ${nReacts}`;
             } else if (!msg.mine) {
                 // No reaction on the contact's message, so let's display the 'Add Reaction' UI
@@ -580,10 +681,13 @@ function updateChat(contact) {
             if (spanReaction) {
                 if (msg.mine) {
                     // My message: reactions on the left
+                    spanReaction.style.left = `5px`;
                     divMessage.appendChild(spanReaction);
                     divMessage.appendChild(pMessage);
                 } else {
                     // Their message: reactions on the right
+                    spanReaction.style.left = `-2px`;
+                    spanReaction.style.bottom = `-2px`;
                     divMessage.appendChild(pMessage);
                     divMessage.appendChild(spanReaction);
                 }
@@ -600,6 +704,7 @@ function updateChat(contact) {
         const cLastMsg = cContact.contents[cContact.contents.length - 1];
         if (cLastMsg.id !== strLastMsgID) {
             strLastMsgID = cLastMsg.id;
+            adjustSize();
             domChatMessages.scrollTo(0, domChatMessages.scrollHeight);
         }
     } else {
@@ -609,6 +714,8 @@ function updateChat(contact) {
         // Nuke the message list
         domChatMessages.innerHTML = ``;
     }
+
+    adjustSize();
 }
 
 /**
@@ -621,9 +728,24 @@ function closeChat() {
     strOpenChat = "";
 }
 
-window.addEventListener("DOMContentLoaded", () => {
+/**
+ * Our Bech32 Nostr Public Key
+ */
+let strPubkey;
+
+window.addEventListener("DOMContentLoaded", async () => {
+    adjustSize();
+
     // Hook up our static buttons
-    domLoginBtn.onclick = login;
+    domLoginBtn.onclick = async () => {
+        // Import and derive our keys
+        try {
+            const { public, private } = await invoke("login", { importKey: domLoginInput.value.trim() });
+            strPubkey = public;
+            // Open the Encryption Flow
+            openEncryptionFlow(private);
+        } catch (e) { console.error(e) }
+    }
     domChatBackBtn.onclick = closeChat;
     domChatNewBackBtn.onclick = closeChat;
     domChatNewStartBtn.onclick = () => {
@@ -631,7 +753,16 @@ window.addEventListener("DOMContentLoaded", () => {
         domChatNewInput.value = ``;
     };
 
+    // Load the DB
+    store = await load('vector.json', { autoSave: true });
+
+    // If a local encrypted key exists, boot up the decryption UI
+    if (await hasKey()) {
+        openEncryptionFlow(null, true);
+    }
+
     // Hook up an 'Enter' listener on the Message Box for sending messages
+    const strOriginalInputPlaceholder = domChatMessageInput.getAttribute('placeholder');
     domChatMessageInput.onkeydown = async (evt) => {
         // Allow 'Shift + Enter' to create linebreaks, while only 'Enter' sends a message
         if (evt.code === 'Enter' && !evt.shiftKey) {
@@ -639,16 +770,33 @@ window.addEventListener("DOMContentLoaded", () => {
             if (domChatMessageInput.value.trim().length) {
                 // Cache the message and previous Input Placeholder
                 const strMessage = domChatMessageInput.value;
-                const strPlaceholder = domChatMessageInput.getAttribute('placeholder');
 
                 // Send the message, and display "Sending..." as the placeholder
                 domChatMessageInput.value = '';
                 domChatMessageInput.setAttribute('placeholder', 'Sending...');
-                await message(strOpenChat, strMessage);
+                try {
+                    await message(strOpenChat, strMessage);
+                } catch(e) {
+                    // TODO: temporary storage of failed messages for later re-try attempts
+                }
 
-                // Sent! Reset the placeholder
-                domChatMessageInput.setAttribute('placeholder', strPlaceholder);
+                // Reset the placeholder
+                domChatMessageInput.setAttribute('placeholder', strOriginalInputPlaceholder);
             }
         }
     };
 });
+
+/**
+ * Resize certain tricky components (i.e: the Chat Box) on window resizes.
+ * 
+ * This can also be re-called when some components are spawned, since they can
+ * affect the height and width of other components, too.
+ */
+function adjustSize() {
+    // Chat Box: resize the chat to fill the remaining space after the upper Contact area (name)
+    const rectContact = domChatContact.getBoundingClientRect();
+    domChat.style.height = (window.innerHeight - rectContact.height) + `px`;
+}
+
+window.onresize = adjustSize;

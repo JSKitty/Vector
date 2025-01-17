@@ -6,12 +6,19 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Chatstr</title>
     <script src="/main.js" defer></script>
+    <script src="/js/db.js" defer></script>
     <script src="/js/markdown.js" defer></script>
     <script src="/js/emoji.js" defer></script>
   </head>
 
   <body>
     <main class="container">
+      <!-- The Global emoji picker popup -->
+      <div class="emoji-picker" tabindex="-1">
+        <input id="emoji-search-input" placeholder="Search..." style="width: -webkit-fill-available; height: 12px; margin-bottom: 12px;">
+        <div id="emoji-results"></div>
+      </div>
+
       <div id="chats" class="chats">
         <div id="account" class="account row"></div>
         <div id="chat-list">
@@ -28,10 +35,6 @@
         </div>
 
         <div class="row" id="chat-box">
-          <div class="emoji-picker" tabindex="-1">
-            <input id="emoji-search-input" placeholder="Search..." style="width: -webkit-fill-available; height: 12px; margin-bottom: 12px;">
-            <div id="emoji-results"></div>
-          </div>
           <div style="width: 95%; align-items: center;" class="row">
             <textarea id="chat-input" placeholder="Enter message..."></textarea>
             <button id="chat-input-emoji" class="emoji-button">☻</button>
@@ -61,10 +64,22 @@
       <div id="login-form">
         <h1 style="margin-bottom: 0; font-size: 50px;">Chatstr</h1>
         <span id="version"></span>
-        <h3 class="text-gradient" style="margin-top: 100px;">A Private, Decentralised, Modern communication app.</h3>
-        <div style="position: absolute; bottom: 8px;" class="row">
-          <input type="password" style="width: 223px; margin-left: 8px;" id="login-input" placeholder="Enter nsec or Seed Phrase..." />
-          <button id="login-btn">Login</button>
+        <div id="login-import">
+          <h3 class="text-gradient" style="margin-top: 100px;">A Private, Decentralised, Modern communication app.</h3>
+          <div class="row" style="position: absolute; bottom: 8px;">
+            <input type="password" style="width: 223px; margin-left: 8px;" id="login-input" placeholder="Enter nsec or Seed Phrase..." />
+            <button id="login-btn">Login</button>
+          </div>
+        </div>
+        <div id="login-encrypt" style="width: 100%; bottom: 8px; display: none;">
+          <h3 id="login-encrypt-title" class="text-gradient" style="margin-top: 100px;">Choose an Encryption Pin</h3>
+          <div id="login-encrypt-pins" class="row pin-row">
+            <input type="password" maxlength="1" id="pin-0">
+            <input type="password" maxlength="1" id="pin-1">
+            <input type="password" maxlength="1" id="pin-2">
+            <input type="password" maxlength="1" id="pin-3">
+            <input type="password" maxlength="1" id="pin-4">
+          </div>
         </div>
       </div>
 
