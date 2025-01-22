@@ -6,12 +6,26 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Chatstr</title>
     <script src="/main.js" defer></script>
+    <script src="/js/settings.js" defer></script>
+    <script src="/js/misc.js" defer></script>
     <script src="/js/db.js" defer></script>
     <script src="/js/markdown.js" defer></script>
     <script src="/js/emoji.js" defer></script>
   </head>
 
   <body>
+    <div id="popup-container" class="popup-container">
+      <center id="popup" class="popup" style="display: none;">
+        <h2 id="popupTitle"></h2>
+        <p id="popupSubtext"><br><i style="opacity: 0.5"></i></p>
+
+        <input id="popupInput">
+        <div class="divider"></div>
+
+        <button id="popupConfirm">Confirm</button><button id="popupCancel" style="opacity: 0.8;margin-left: 10px;">Cancel</button>
+      </center>
+    </div>
+
     <main class="container">
       <!-- The Global emoji picker popup -->
       <div class="emoji-picker" tabindex="-1">
@@ -20,7 +34,7 @@
       </div>
 
       <div id="chats" class="chats">
-        <div id="account" class="account row"></div>
+        <div id="account" class="account"></div>
         <div id="chat-list">
           
         </div>
@@ -29,7 +43,7 @@
       <div id="chat" class="chat" style="display: none;">
         <h3 class="back-btn" id="chat-back-btn">Back</h3>
         <h3 id="chat-contact"></h3>
-        <span id="chat-contact-status"></span>
+        <span class="cutoff" id="chat-contact-status"></span>
         <div id="chat-messages" class="chat-messages">
 
         </div>

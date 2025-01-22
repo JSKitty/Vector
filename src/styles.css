@@ -31,6 +31,28 @@ body {
   text-align: center;
 }
 
+.popup-container {
+  z-index: 1001;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  justify-content: center;
+}
+
+.popup {
+  position: absolute;
+  background-color: rgba(0, 0, 0, 1);
+  /* Too many weird WebKit filter issues - disabling and going solid for now */
+  /* backdrop-filter: blur(10px); */
+  box-shadow: 0 0 15px rgba(112, 0, 128, 0.20);
+  border-style: solid;
+  border-radius: 8px;
+  padding: 30px;
+  border-color: rgba(112, 0, 128, 0.5);
+  border-width: 1px;
+  margin-top: 30vh;
+}
+
 .text-gradient {
   background: linear-gradient(to right, #f8f8f8 13.87%, #b188e2 60%);
   background-size: 200% 200%;
@@ -63,8 +85,24 @@ body {
   align-items: center;
 }
 
+.account .placeholder-avatar {
+  margin-right: 10px;
+}
+
+.placeholder-avatar p {
+  top: 25px;
+  margin: 0;
+  position: relative;
+  line-height: 0;
+  font-size: 20px;
+  opacity: 0.75;
+}
+
 .account img {
+  object-fit: cover;
+  object-position: center;
   height: 50px;
+  width: 50px;
   margin-right: 10px;
   border-radius: 100%;
 }
@@ -89,13 +127,28 @@ body {
 .chatlist-contact-preview {
   margin-top: auto;
   margin-bottom: auto;
-  max-width: 250px;
+  margin-right: 60px;
+  max-width: -webkit-fill-available;
 }
 
 .chatlist-contact img {
-  width: auto;
-  height: 100%;
+  object-fit: cover;
+  object-position: center;
+  min-width: 50px;
+  min-height: 50px;
+  max-width: 50px;
+  max-height: 50px;
   border-radius: 100%;
+  margin-top: auto;
+  margin-bottom: auto;
+}
+
+.placeholder-avatar {
+  border-radius: 100%;
+  min-height: 50px;
+  min-width: 50px;
+  max-height: 50px;
+  max-width: 50px;
 }
 
 .chatlist-contact-preview h4 {
@@ -103,19 +156,14 @@ body {
   padding-right: 15px;
   margin-top: auto;
   margin-bottom: auto;
-  text-overflow: ellipsis;
-  overflow: hidden;
-  white-space: nowrap;
   text-align: left;
 }
 
 .chatlist-contact-preview p {
-  opacity: 0.6;
+  /* Opacity breaks the Popup by making the text bleed through it... WTF? */
+  /* opacity: 0.6;*/
   margin: 0;
   margin-left: 15px;
-  text-overflow: ellipsis;
-  overflow: hidden;
-  white-space: nowrap;
   text-align: left;
 }
 
@@ -162,6 +210,9 @@ body {
   font-size: 14px;
   margin-bottom: 2px;
   display: block;
+  width: 60%;
+  margin-left: auto;
+  margin-right: auto;
 }
 
 .chat-messages {
@@ -191,8 +242,10 @@ body {
 }
 
 .msg-them img {
+  object-fit: cover;
+  object-position: center;
   height: 50px;
-  width: auto;
+  width: 50px;
   border-radius: 100%;
   margin-top: 15px;
   margin-right: 10px;
@@ -244,7 +297,7 @@ body {
   cursor: default;
   position: relative;
   height: fit-content;
-  width: fit-content;
+  width: 50px;
 }
 
 .msg-them:hover .add-reaction  {
@@ -322,6 +375,13 @@ body {
   justify-content: center;
 }
 
+.cutoff {
+  text-overflow: ellipsis;
+  overflow: hidden;
+  white-space: nowrap;
+  display: block;
+}
+
 a {
   font-weight: 500;
   color: #646cff;
@@ -364,6 +424,22 @@ button {
 
 button:active {
   background-color: #0f0f0f69;
+}
+
+.btn {
+  cursor: pointer;
+}
+
+.btn:hover {
+  opacity: 0.75;
+}
+
+.divider {
+  height: 1px;
+  width: 100%;
+  background-color: rgba(128, 0, 128, 0.25);
+  margin-top: 15px;
+  margin-bottom: 15px
 }
 
 #login-input {
