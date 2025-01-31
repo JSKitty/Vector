@@ -24,6 +24,7 @@ static TAURI_APP: OnceCell<AppHandle> = OnceCell::new();
 struct Message {
     id: String,
     content: String,
+    replied_to: String,
     reactions: Vec<Reaction>,
     at: u64,
     pending: bool,
@@ -207,7 +208,7 @@ async fn fetch_messages(init: bool) -> Result<Vec<Profile>, ()> {
         // Fetch GiftWraps related to us
         let filter = Filter::new().pubkey(my_public_key).kind(Kind::GiftWrap);
         let events = client
-            .fetch_events(vec![filter], std::time::Duration::from_secs(30))
+            .fetch_events(filter, std::time::Duration::from_secs(30))
             .await
             .unwrap();
 
@@ -221,13 +222,14 @@ async fn fetch_messages(init: bool) -> Result<Vec<Profile>, ()> {
 }
 
 #[tauri::command]
-async fn message(receiver: String, content: String) -> Result<bool, String> {
+async fn message(receiver: String, content: String, replied_to: String) -> Result<bool, String> {
     // Immediately add the message to our state as "Pending", we'll update it as either Sent (non-pending) or Failed in the future
     let pending_count = STATE.lock().await.get_profile(receiver.clone()).unwrap_or(&Profile::new()).messages.iter().filter(|m| m.pending).count();
     let pending_id = String::from("pending-") + &pending_count.to_string();
     let msg = Message {
         id: pending_id.clone(),
         content: content.clone(),
+        replied_to: replied_to.clone(),
         at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -247,20 +249,28 @@ async fn message(receiver: String, content: String) -> Result<bool, String> {
     // Convert the Bech32 String in to a PublicKey
     let receiver_pubkey = PublicKey::from_bech32(receiver.clone().as_str()).unwrap();
 
-    // Build the NIP-17 rumor
-    let rumor: UnsignedEvent = EventBuilder::private_msg_rumor(receiver_pubkey, content.clone()).build(my_public_key);
+    // Prepare the NIP-17 rumor
+    let mut rumor = EventBuilder::private_msg_rumor(receiver_pubkey, content.clone());
+
+    // If a reply reference is included, add the tag
+    if !replied_to.is_empty() {
+        rumor = rumor.tag(Tag::custom(TagKind::e(), [replied_to, String::from(""), String::from("reply")]));
+    }
+
+    // Build the rumor with our key (unsigned)
+    let built_rumor = rumor.build(my_public_key);
 
     // Send message to the real receiver
-    match client.gift_wrap(&receiver_pubkey, rumor.clone(), []).await {
+    match client.gift_wrap(&receiver_pubkey, built_rumor.clone(), []).await {
         Ok(_) => {
             // Send message to our own public key, to allow for message recovering
-            match client.gift_wrap(&my_public_key, rumor.clone(), []).await {
+            match client.gift_wrap(&my_public_key, built_rumor.clone(), []).await {
                 Ok(_) => {
                     // Mark the message as a success
                     let mut state = STATE.lock().await;
                     let chat = state.profiles.iter_mut().find(|chat| chat.id == receiver).unwrap();
                     let message = chat.get_message_mut(pending_id).unwrap();
-                    message.id = rumor.id.unwrap().to_hex();
+                    message.id = built_rumor.id.unwrap().to_hex();
                     message.pending = false;
                     state.has_state_changed = true;
                     return Ok(true);
@@ -271,7 +281,7 @@ async fn message(receiver: String, content: String) -> Result<bool, String> {
                     let mut state = STATE.lock().await;
                     let chat = state.profiles.iter_mut().find(|chat| chat.id == receiver).unwrap();
                     let message = chat.get_message_mut(pending_id).unwrap();
-                    message.id = rumor.id.unwrap().to_hex();
+                    message.id = built_rumor.id.unwrap().to_hex();
                     message.pending = false;
                     state.has_state_changed = true;
                     return Ok(true)
@@ -308,7 +318,7 @@ async fn react(reference_id: String, npub: String, emoji: String) -> Result<bool
         receiver_pubkey,
         Some(Kind::PrivateDirectMessage),
         emoji.clone(),
-    );
+    ).build(my_public_key);
 
     // Send reaction to the real receiver
     client
@@ -374,7 +384,7 @@ async fn load_profile(npub: String) -> Result<Profile, ()> {
         .kind(Kind::from_u16(30315))
         .limit(1);
     let status = match client
-        .fetch_events(vec![status_filter], std::time::Duration::from_secs(10))
+        .fetch_events(status_filter, std::time::Duration::from_secs(10))
         .await
     {
         Ok(res) => {
@@ -556,14 +566,33 @@ async fn handle_event(event: Event, is_new: bool) {
                     sender.to_bech32().expect("Failed to convert sender's public key to bech32")
                 };
 
+                // Check if the message replies to anything
+                let mut replied_to = String::from("");
+                match rumor.tags.find(TagKind::e()) {
+                    Some(tag) => {
+                        if tag.is_reply() {
+                            // Add the referred Event ID to our `replied_to` field
+                            replied_to = tag.content().unwrap().to_string();
+                        }
+                    },
+                    None => ()
+                };
+
                 // Send an OS notification for incoming messages
                 if !is_mine && is_new {
                     // Find the name of the sender, if we have it
-                    let profile = state.get_profile(contact.clone()).unwrap();
-                    let display_name = match profile.name.is_empty() {
-                        true => String::from("New Message"),
-                        false => profile.name.clone()
-                    };
+                    let display_name: String;
+                    match state.get_profile(contact.clone()) {
+                        Ok(profile) => {
+                            // We have a profile, just check for a name
+                            display_name = match profile.name.is_empty() {
+                                true => String::from("New Message"),
+                                false => profile.name.clone()
+                            };
+                        },
+                        // No profile
+                        Err(_) => display_name = String::from("New Message")
+                    }
                     show_notification(display_name, rumor.content.clone());
                 }
 
@@ -571,6 +600,7 @@ async fn handle_event(event: Event, is_new: bool) {
                 let msg = Message {
                     id: rumor.id.unwrap().to_hex(),
                     content: rumor.content,
+                    replied_to,
                     at: rumor.created_at.as_u64(),
                     reactions: Vec::new(),
                     mine: is_mine,
@@ -620,10 +650,10 @@ async fn handle_event(event: Event, is_new: bool) {
                         // Add the reaction
                         match state.add_reaction(npub, reference_id.to_string(), reaction) {
                             true => {},
-                            false => { println!("Couldn't find a profile for a reacted-to message, odd!") }
+                            false => (/* Couldn't find the relevant Profile or Message */)
                         }
                     }
-                    None => println!("No referenced message for reaction"),
+                    None => (/* No Reference (Note ID) supplied */),
                 }
             }
             // Vector-specific events (NIP-78)
@@ -678,7 +708,7 @@ async fn notifs() -> Result<bool, String> {
     let filter = Filter::new().pubkey(pubkey).kind(Kind::GiftWrap).limit(0);
 
     // Subscribe to the filter and begin handling incoming events
-    match client.subscribe(vec![filter], None).await {
+    match client.subscribe(filter, None).await {
         Ok(_) => { /* Good! */ },
         Err(e) => { return Err(e.to_string()) }
     }
@@ -726,16 +756,41 @@ struct LoginKeyPair {
 }
 
 #[tauri::command]
-async fn login(import_key: String) -> Result<LoginKeyPair, ()> {
+async fn login(import_key: String) -> Result<LoginKeyPair, String> {
     let keys: Keys;
-    // TODO: add validation, error handling, etc
+
+    // If we're already logged in (i.e: Developer Mode with frontend hot-loading), just return the existing keys.
+    // TODO: in the future, with event-based state changes, we need to make sure the state syncs correctly too!
+    if let Some(client) = NOSTR_CLIENT.get() {
+        let signer = client.signer().await.unwrap();
+        let new_keys = Keys::parse(&import_key).unwrap();
+
+        /* Derive our Public Key from the Import and Existing key sets */
+        let prev_npub = signer.get_public_key().await.unwrap().to_bech32().unwrap();
+        let new_npub = new_keys.public_key.to_bech32().unwrap();
+        if prev_npub == new_npub {
+            // Simply return the same KeyPair and allow the frontend to continue login as usual
+            // Note: we also say that the state has changed so that the frontend knows to refresh it's data
+            STATE.lock().await.has_state_changed = true;
+            return Ok(LoginKeyPair { public: signer.get_public_key().await.unwrap().to_bech32().unwrap(), private: new_keys.secret_key().to_bech32().unwrap() });
+        } else {
+            // This shouldn't happen in the real-world, but just in case...
+            return Err(String::from("An existing Nostr Client instance exists, but a second incompatible key import was requested."));
+        }
+    }
 
     // If it's an nsec, import that
     if import_key.starts_with("nsec") {
-        keys = Keys::parse(&import_key).unwrap();
+        match Keys::parse(&import_key) {
+            Ok(parsed) => keys = parsed,
+            Err(_) => return Err(String::from("Invalid nsec"))
+        };
     } else {
         // Otherwise, we'll try importing it as a mnemonic seed phrase (BIP-39)
-        keys = Keys::from_mnemonic(import_key, Some(String::new())).unwrap();
+        match Keys::from_mnemonic(import_key, Some(String::new())) {
+            Ok(parsed) => keys = parsed,
+            Err(_) => return Err(String::from("Invalid Seed Phrase"))
+        };
     }
 
     // Initialise the Nostr client
@@ -753,7 +808,7 @@ async fn login(import_key: String) -> Result<LoginKeyPair, ()> {
     STATE.lock().await.profiles.push(profile);
 
     // Return our npub to the frontend client
-    Ok( LoginKeyPair { public: npub, private: keys.secret_key().to_bech32().unwrap()} )
+    Ok(LoginKeyPair { public: npub, private: keys.secret_key().to_bech32().unwrap() })
 }
 
 #[tauri::command]
@@ -766,9 +821,15 @@ async fn acknowledge_state_change() {
     STATE.lock().await.has_state_changed = false;
 }
 
+/// Returns `true` if the client has connected, `false` if it was already connected
 #[tauri::command]
-async fn connect() {
+async fn connect() -> bool {
     let client = NOSTR_CLIENT.get().expect("Nostr client not initialized");
+
+    // If we're already connected to some relays - skip and tell the frontend our client is already online
+    if client.relays().await.len() > 0 {
+        return false;
+    }
 
     // Add our 'Trusted Relay' (see Rustdoc for TRUSTED_RELAY for more info)
     client.add_relay(TRUSTED_RELAY).await.unwrap();
@@ -780,6 +841,7 @@ async fn connect() {
 
     // Connect!
     client.connect().await;
+    true
 }
 
 // Convert string to bytes, ensuring we're dealing with the raw content
