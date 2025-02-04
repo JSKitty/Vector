@@ -1,21 +1,34 @@
-use rand::Rng;
+use std::borrow::Cow;
 use argon2::{Argon2, Params, Version};
-use tokio::sync::Mutex;
-use chacha20::ChaCha20;
 use chacha20::cipher::{KeyIvInit, StreamCipher};
+use chacha20::ChaCha20;
 use lazy_static::lazy_static;
 use nostr_sdk::prelude::*;
 use once_cell::sync::OnceCell;
+use rand::Rng;
+use tokio::sync::Mutex;
+use aes::Aes256;
+use aes_gcm::{
+    aead::{AeadInPlace, KeyInit},
+    AesGcm,
+};
+use generic_array::{GenericArray, typenum::U16};
 
 use tauri::{AppHandle, Manager};
 use tauri_plugin_notification::NotificationExt;
+use tauri_plugin_fs::FsExt;
 
 /// # Trusted Relay
-/// 
+///
 /// The 'Trusted Relay' handles events that MAY have a small amount of public-facing metadata attached (i.e: Expiration tags).
-/// 
+///
 /// This relay may be used for events like Typing Indicators, Key Exchanges (forward-secrecy setup) and more.
 static TRUSTED_RELAY: &str = "wss://jskitty.cat/nostr";
+
+/// # Trusted NIP-96 Server
+///
+/// A temporary hardcoded NIP-96 server, handling file uploads
+static TRUSTED_NIP96: &str = "https://nostr.build";
 
 static NOSTR_CLIENT: OnceCell<Client> = OnceCell::new();
 static TAURI_APP: OnceCell<AppHandle> = OnceCell::new();
@@ -25,11 +38,24 @@ struct Message {
     id: String,
     content: String,
     replied_to: String,
+    attachments: Vec<Attachment>,
     reactions: Vec<Reaction>,
     at: u64,
     pending: bool,
     failed: bool,
     mine: bool,
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+struct Attachment {
+    /** The encryption Nonce as the unique file ID */
+    id: String,
+    /** The file extension */
+    extension: String,
+    /** The storage directory path (typically the ~/Downloads folder) */
+    path: String,
+    /** Whether the file has been downloaded or not */
+    downloaded: bool,
 }
 
 #[derive(serde::Serialize, Clone, Debug)]
@@ -65,7 +91,7 @@ impl Profile {
             status: Status::new(),
             last_updated: 0,
             typing_until: 0,
-            mine: false
+            mine: false,
         }
     }
 
@@ -105,8 +131,8 @@ impl Profile {
                     msg.reactions.push(reaction);
                 }
                 true
-            },
-            Err(_) => false
+            }
+            Err(_) => false,
         }
     }
 }
@@ -123,7 +149,7 @@ impl Status {
         Self {
             title: String::new(),
             purpose: String::new(),
-            url: String::new()
+            url: String::new(),
         }
     }
 }
@@ -182,11 +208,11 @@ impl ChatState {
                     true => {
                         self.has_state_changed = true;
                         true
-                    },
-                    false => false
+                    }
+                    false => false,
                 }
-            },
-            Err(_) => false
+            }
+            Err(_) => false,
         }
     }
 }
@@ -222,9 +248,29 @@ async fn fetch_messages(init: bool) -> Result<Vec<Profile>, ()> {
 }
 
 #[tauri::command]
-async fn message(receiver: String, content: String, replied_to: String) -> Result<bool, String> {
+async fn message(receiver: String, content: String, replied_to: String, file_path: String) -> Result<bool, String> {
+    // If there's a file attached, build it's attachment
+    let mut attachments: Vec<Attachment> = Vec::new();
+    if !file_path.is_empty() {
+        let ext = file_path.clone().rsplit('.').next().unwrap_or("").to_lowercase();
+        attachments.push(Attachment {
+            id: String::new(),
+            extension: ext.to_string(),
+            path: file_path.clone(),
+            downloaded: true
+        });
+    }
+
     // Immediately add the message to our state as "Pending", we'll update it as either Sent (non-pending) or Failed in the future
-    let pending_count = STATE.lock().await.get_profile(receiver.clone()).unwrap_or(&Profile::new()).messages.iter().filter(|m| m.pending).count();
+    let pending_count = STATE
+        .lock()
+        .await
+        .get_profile(receiver.clone())
+        .unwrap_or(&Profile::new())
+        .messages
+        .iter()
+        .filter(|m| m.pending)
+        .count();
     let pending_id = String::from("pending-") + &pending_count.to_string();
     let msg = Message {
         id: pending_id.clone(),
@@ -234,6 +280,7 @@ async fn message(receiver: String, content: String, replied_to: String) -> Resul
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs(),
+        attachments: attachments.clone(),
         reactions: Vec::new(),
         pending: true,
         failed: false,
@@ -250,25 +297,107 @@ async fn message(receiver: String, content: String, replied_to: String) -> Resul
     let receiver_pubkey = PublicKey::from_bech32(receiver.clone().as_str()).unwrap();
 
     // Prepare the NIP-17 rumor
-    let mut rumor = EventBuilder::private_msg_rumor(receiver_pubkey, content.clone());
+    let mut rumor = if attachments.is_empty() {
+        // Text Message
+        EventBuilder::private_msg_rumor(receiver_pubkey, content.clone())
+    } else {
+        // Load the file
+        let file = std::fs::read(file_path.as_str()).unwrap();
+
+        // Encrypt the attachment
+        let params = generate_encryption_params();
+        let enc_file = encrypt_data(file.as_slice(), &params).unwrap();
+
+        // Update the attachment in-state
+        {
+            let mut state = STATE.lock().await;
+            let chat = state
+                        .profiles
+                        .iter_mut()
+                        .find(|chat| chat.id == receiver)
+                        .unwrap();
+            let message = chat.get_message_mut(pending_id.clone()).unwrap();
+            let msg_attachment: &mut Attachment = message.attachments.iter_mut().nth(0).unwrap();
+            msg_attachment.id = params.nonce.clone();
+        }
+
+        // Upload the attachment
+        match get_server_config(Url::parse("https://medea-small.jskitty.cat").unwrap(), None).await {
+            Ok(conf) => {
+                // Format a Mime Type from the file extension
+                let mime_type = match file_path.clone().rsplit('.').next().unwrap_or("").to_lowercase().as_str() {
+                    "png" => "image/png",
+                    "jpg" | "jpeg" => "image/jpeg",
+                    "gif" => "image/gif",
+                    "webp" => "image/webp",
+                    _ => "application/octet-stream",
+                };
+
+                // Upload the file to the server
+                let client = NOSTR_CLIENT.get().expect("Nostr client not initialized");
+                let signer = client.signer().await.unwrap();
+                match upload_data(&signer, &conf, enc_file, Some(mime_type), None).await {
+                    Ok(url) => {
+                        // Create the attachment rumor
+                        let attachment_rumor = EventBuilder::new(Kind::from_u16(15), url.to_string());
+
+                        // Append decryption keys and file metadata
+                        attachment_rumor
+                            .tag(Tag::public_key(receiver_pubkey))
+                            .tag(Tag::custom(TagKind::custom("file-type"), [mime_type]))
+                            .tag(Tag::custom(TagKind::custom("encryption-algorithm"), ["aes-gcm"]))
+                            .tag(Tag::custom(TagKind::custom("decryption-key"), [params.key.as_str()]))
+                            .tag(Tag::custom(TagKind::custom("decryption-nonce"), [params.nonce.as_str()]))
+                    },
+                    Err(_) => {
+                        // The file upload failed: so we mark the message as failed and notify of an error
+                        let mut state = STATE.lock().await;
+                        let chat = state
+                            .profiles
+                            .iter_mut()
+                            .find(|chat| chat.id == receiver)
+                            .unwrap();
+                        let failed_msg = chat.get_message_mut(pending_id).unwrap();
+                        failed_msg.failed = true;
+                        state.has_state_changed = true;
+                        return Err(String::from("Failed to upload file"));
+                    }
+                }
+            },
+            Err(e) => return Err(String::from("Failed to sync server configuration"))
+        }
+    };
 
     // If a reply reference is included, add the tag
     if !replied_to.is_empty() {
-        rumor = rumor.tag(Tag::custom(TagKind::e(), [replied_to, String::from(""), String::from("reply")]));
+        rumor = rumor.tag(Tag::custom(
+            TagKind::e(),
+            [replied_to, String::from(""), String::from("reply")],
+        ));
     }
 
     // Build the rumor with our key (unsigned)
     let built_rumor = rumor.build(my_public_key);
 
     // Send message to the real receiver
-    match client.gift_wrap(&receiver_pubkey, built_rumor.clone(), []).await {
+    match client
+        .gift_wrap(&receiver_pubkey, built_rumor.clone(), [])
+        .await
+    {
         Ok(_) => {
             // Send message to our own public key, to allow for message recovering
-            match client.gift_wrap(&my_public_key, built_rumor.clone(), []).await {
+            match client
+                .gift_wrap(&my_public_key, built_rumor.clone(), [])
+                .await
+            {
                 Ok(_) => {
                     // Mark the message as a success
                     let mut state = STATE.lock().await;
-                    let chat = state.profiles.iter_mut().find(|chat| chat.id == receiver).unwrap();
+                    let chat = state
+                        .profiles
+                        .iter_mut()
+                        .find(|chat| chat.id == receiver)
+                        .unwrap();
                     let message = chat.get_message_mut(pending_id).unwrap();
                     message.id = built_rumor.id.unwrap().to_hex();
                     message.pending = false;
@@ -279,19 +408,27 @@ async fn message(receiver: String, content: String, replied_to: String) -> Resul
                     // This is an odd case; the message was sent to the receiver, but NOT ourselves
                     // We'll class it as sent, for now...
                     let mut state = STATE.lock().await;
-                    let chat = state.profiles.iter_mut().find(|chat| chat.id == receiver).unwrap();
+                    let chat = state
+                        .profiles
+                        .iter_mut()
+                        .find(|chat| chat.id == receiver)
+                        .unwrap();
                     let message = chat.get_message_mut(pending_id).unwrap();
                     message.id = built_rumor.id.unwrap().to_hex();
                     message.pending = false;
                     state.has_state_changed = true;
-                    return Ok(true)
+                    return Ok(true);
                 }
             }
-        },
+        }
         Err(_) => {
             // Mark the message as a failure, bad message, bad!
             let mut state = STATE.lock().await;
-            let chat = state.profiles.iter_mut().find(|chat| chat.id == receiver).unwrap();
+            let chat = state
+                .profiles
+                .iter_mut()
+                .find(|chat| chat.id == receiver)
+                .unwrap();
             let failed_msg = chat.get_message_mut(pending_id).unwrap();
             failed_msg.failed = true;
             state.has_state_changed = true;
@@ -318,7 +455,8 @@ async fn react(reference_id: String, npub: String, emoji: String) -> Result<bool
         receiver_pubkey,
         Some(Kind::PrivateDirectMessage),
         emoji.clone(),
-    ).build(my_public_key);
+    )
+    .build(my_public_key);
 
     // Send reaction to the real receiver
     client
@@ -336,7 +474,10 @@ async fn react(reference_id: String, npub: String, emoji: String) -> Result<bool
                 author_id: my_public_key.to_hex(),
                 emoji,
             };
-            return Ok(STATE.lock().await.add_reaction(npub, reference_id, reaction));
+            return Ok(STATE
+                .lock()
+                .await
+                .add_reaction(npub, reference_id, reaction));
         }
         Err(e) => {
             eprintln!("Error: {:?}", e);
@@ -370,11 +511,17 @@ async fn load_profile(npub: String) -> Result<Profile, ()> {
                 state.profiles.push(new_profile);
                 state.get_profile(npub.clone()).unwrap()
             }
-        }.clone();
+        }
+        .clone();
 
         // If the profile has been refreshed in the last 30s, return it's cached version
-        if profile.last_updated + 30 > std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() {
-            return Ok(profile.clone())
+        if profile.last_updated + 30
+            > std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        {
+            return Ok(profile.clone());
         }
     }
 
@@ -427,7 +574,10 @@ async fn load_profile(npub: String) -> Result<Profile, ()> {
             // Update the Metadata
             profile_mutable.from_metadata(meta);
             // And apply the current update time
-            profile_mutable.last_updated = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            profile_mutable.last_updated = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
             // And mark the state as changed
             let ret_profile = profile_mutable.clone();
             state.has_state_changed = true;
@@ -450,27 +600,42 @@ async fn update_profile(name: String, avatar: String) -> Result<Profile, ()> {
     // Get our profile
     let mut meta: Metadata;
     let mut state = STATE.lock().await;
-    let profile = state.get_profile(my_public_key.to_bech32().unwrap()).unwrap().clone();
+    let profile = state
+        .get_profile(my_public_key.to_bech32().unwrap())
+        .unwrap()
+        .clone();
 
     // We'll apply the changes to the previous profile and carry-on the rest
-    meta = Metadata::new()
-        .name(if name.is_empty() { profile.name.clone() } else { name });
+    meta = Metadata::new().name(if name.is_empty() {
+        profile.name.clone()
+    } else {
+        name
+    });
 
     // Optional avatar
     if !avatar.is_empty() || !profile.avatar.is_empty() {
-        meta = meta.picture(Url::parse(if avatar.is_empty() { profile.avatar.as_str() } else { avatar.as_str() }).unwrap());
+        meta = meta.picture(
+            Url::parse(if avatar.is_empty() {
+                profile.avatar.as_str()
+            } else {
+                avatar.as_str()
+            })
+            .unwrap(),
+        );
     }
 
     // Broadcast the profile update
     match client.set_metadata(&meta).await {
         Ok(_event) => {
             // Apply our Metadata to our Profile
-            let profile_mutable = state.get_profile_mut(my_public_key.to_bech32().unwrap()).unwrap();
+            let profile_mutable = state
+                .get_profile_mut(my_public_key.to_bech32().unwrap())
+                .unwrap();
             profile_mutable.from_metadata(meta);
             state.has_state_changed = true;
             Ok(profile.clone())
-        },
-        Err(_e) => { Err(()) }
+        }
+        Err(_e) => Err(()),
     }
 }
 
@@ -483,17 +648,54 @@ async fn update_status(status: String) -> Result<Profile, ()> {
     let my_public_key = signer.get_public_key().await.unwrap();
 
     // Build and broadcast the status
-    let status_builder = EventBuilder::new(Kind::from_u16(30315), status.as_str()).tag(Tag::custom(TagKind::d(), vec!["general"]));
+    let status_builder = EventBuilder::new(Kind::from_u16(30315), status.as_str())
+        .tag(Tag::custom(TagKind::d(), vec!["general"]));
     match client.send_event_builder(status_builder).await {
         Ok(_event) => {
             // Add the status to our profile
             let mut state = STATE.lock().await;
-            let profile = state.get_profile_mut(my_public_key.to_bech32().unwrap()).unwrap();
+            let profile = state
+                .get_profile_mut(my_public_key.to_bech32().unwrap())
+                .unwrap();
             profile.status.purpose = String::from("general");
             profile.status.title = status;
             Ok(profile.clone())
+        }
+        Err(_e) => Err(()),
+    }
+}
+
+#[tauri::command]
+async fn upload_avatar(filepath: String) -> Result<String, String> {
+    let app_handle = TAURI_APP.get().unwrap().clone();
+
+    // Grab the file
+    return match app_handle.fs().read(std::path::Path::new(&filepath)) {
+        Ok(file) => {
+            // Get our NIP-96 server config
+            return match get_server_config(Url::parse(TRUSTED_NIP96).unwrap(), None).await {
+                Ok(conf) => {
+                    // Format a Mime Type from the file extension
+                    let mime_type = match filepath.rsplit('.').next().unwrap_or("").to_lowercase().as_str() {
+                        "png" => "image/png",
+                        "jpg" | "jpeg" => "image/jpeg",
+                        "gif" => "image/gif",
+                        "webp" => "image/webp",
+                        _ => "application/octet-stream",
+                    };
+
+                    // Upload the file to the server
+                    let client = NOSTR_CLIENT.get().expect("Nostr client not initialized");
+                    let signer = client.signer().await.unwrap();
+                    return match upload_data(&signer, &conf, file, Some(mime_type), None).await {
+                        Ok(url) => Ok(url.to_string()),
+                        Err(e) => Err(e.to_string())
+                    }
+                },
+                Err(e) => Err(e.to_string())
+            }
         },
-        Err(_e) => { Err(()) },
+        Err(_) => Err(String::from("Image couldn't be loaded from disk"))
     }
 }
 
@@ -512,19 +714,37 @@ async fn start_typing(receiver: String) -> Result<bool, ()> {
     let rumor = EventBuilder::new(Kind::ApplicationSpecificData, "typing")
         .tag(Tag::public_key(receiver_pubkey))
         .tag(Tag::custom(TagKind::d(), vec!["vector"]))
-        .tag(Tag::expiration(Timestamp::from_secs(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 30)))
+        .tag(Tag::expiration(Timestamp::from_secs(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 30,
+        )))
         .build(my_public_key);
 
     // Gift Wrap and send our Typing Indicator to receiver via our Trusted Relay
     // Note: we set a "public-facing" 1-hour expiry so that our trusted NIP-40 relay can purge old Typing Indicators
-    let expiry_time = Timestamp::from_secs(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 3600);
-    match client.gift_wrap_to([TRUSTED_RELAY], &receiver_pubkey, rumor.clone(), [Tag::expiration(expiry_time)]).await {
+    let expiry_time = Timestamp::from_secs(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600,
+    );
+    match client
+        .gift_wrap_to(
+            [TRUSTED_RELAY],
+            &receiver_pubkey,
+            rumor.clone(),
+            [Tag::expiration(expiry_time)],
+        )
+        .await
+    {
         Ok(_) => Ok(true),
-        Err(_) => Ok(false)
+        Err(_) => Ok(false),
     }
 }
-
-
 
 #[tauri::command]
 async fn handle_event(event: Event, is_new: bool) {
@@ -535,47 +755,55 @@ async fn handle_event(event: Event, is_new: bool) {
     let my_public_key = signer.get_public_key().await.unwrap();
 
     // Unwrap the gift wrap
-    let mut state = STATE.lock().await;
     match client.unwrap_gift_wrap(&event).await {
         Ok(UnwrappedGift { rumor, sender }) => {
             // Check if it's mine
             let is_mine = sender == my_public_key;
 
+            // Attempt to get contact public key (bech32)
+            let contact: String = if is_mine {
+                // Try to get the first public key from tags
+                match rumor.tags.public_keys().next() {
+                    Some(pub_key) => match pub_key.to_bech32() {
+                        Ok(p_tag_pubkey_bech32) => p_tag_pubkey_bech32,
+                        Err(_) => {
+                            eprintln!("Failed to convert public key to bech32");
+                            // If conversion fails, fall back to sender
+                            sender
+                                .to_bech32()
+                                .expect("Failed to convert sender's public key to bech32")
+                        }
+                    },
+                    None => {
+                        eprintln!("No public key tag found");
+                        // If no public key found in tags, fall back to sender
+                        sender
+                            .to_bech32()
+                            .expect("Failed to convert sender's public key to bech32")
+                    }
+                }
+            } else {
+                // If not is_mine, just use sender's bech32
+                sender
+                    .to_bech32()
+                    .expect("Failed to convert sender's public key to bech32")
+            };
+
+            // Grab our state Mutex
+            let mut state = STATE.lock().await;
+
             // Direct Message (NIP-17)
             if rumor.kind == Kind::PrivateDirectMessage {
-                // Get contact public key (bech32)
-                let contact: String = if is_mine {
-                    // Try to get the first public key from tags
-                    match rumor.tags.public_keys().next() {
-                        Some(pub_key) => match pub_key.to_bech32() {
-                            Ok(p_tag_pubkey_bech32) => p_tag_pubkey_bech32,
-                            Err(_) => {
-                                eprintln!("Failed to convert public key to bech32");
-                                // If conversion fails, fall back to sender
-                                sender.to_bech32().expect("Failed to convert sender's public key to bech32")
-                            }
-                        },
-                        None => {
-                            eprintln!("No public key tag found");
-                            // If no public key found in tags, fall back to sender
-                            sender.to_bech32().expect("Failed to convert sender's public key to bech32")
-                        }
-                    }
-                } else {
-                    // If not is_mine, just use sender's bech32
-                    sender.to_bech32().expect("Failed to convert sender's public key to bech32")
-                };
-
                 // Check if the message replies to anything
-                let mut replied_to = String::from("");
+                let mut replied_to = String::new();
                 match rumor.tags.find(TagKind::e()) {
                     Some(tag) => {
                         if tag.is_reply() {
                             // Add the referred Event ID to our `replied_to` field
                             replied_to = tag.content().unwrap().to_string();
                         }
-                    },
-                    None => ()
+                    }
+                    None => (),
                 };
 
                 // Send an OS notification for incoming messages
@@ -587,11 +815,11 @@ async fn handle_event(event: Event, is_new: bool) {
                             // We have a profile, just check for a name
                             display_name = match profile.name.is_empty() {
                                 true => String::from("New Message"),
-                                false => profile.name.clone()
+                                false => profile.name.clone(),
                             };
-                        },
+                        }
                         // No profile
-                        Err(_) => display_name = String::from("New Message")
+                        Err(_) => display_name = String::from("New Message"),
                     }
                     show_notification(display_name, rumor.content.clone());
                 }
@@ -602,10 +830,11 @@ async fn handle_event(event: Event, is_new: bool) {
                     content: rumor.content,
                     replied_to,
                     at: rumor.created_at.as_u64(),
+                    attachments: Vec::new(),
                     reactions: Vec::new(),
                     mine: is_mine,
                     pending: false,
-                    failed: false
+                    failed: false,
                 };
                 state.add_message(contact, msg);
             }
@@ -616,29 +845,6 @@ async fn handle_event(event: Event, is_new: bool) {
                         // The message ID being 'reacted' to
                         let reference_id = react_reference_tag.content().unwrap();
 
-                        // The contact (npub) sending us this reaction
-                        let npub: String = if is_mine {
-                            // Try to get the first public key from tags
-                            match rumor.tags.public_keys().next() {
-                                Some(pub_key) => match pub_key.to_bech32() {
-                                    Ok(p_tag_pubkey_bech32) => p_tag_pubkey_bech32,
-                                    Err(_) => {
-                                        eprintln!("Failed to convert public key to bech32");
-                                        // If conversion fails, fall back to sender
-                                        sender.to_bech32().expect("Failed to convert sender's public key to bech32")
-                                    }
-                                },
-                                None => {
-                                    eprintln!("No public key tag found");
-                                    // If no public key found in tags, fall back to sender
-                                    sender.to_bech32().expect("Failed to convert sender's public key to bech32")
-                                }
-                            }
-                        } else {
-                            // If not is_mine, just use sender's bech32
-                            sender.to_bech32().expect("Failed to convert sender's public key to bech32")
-                        };
-
                         // Create the Reaction
                         let reaction = Reaction {
                             id: rumor.id.unwrap().to_hex(),
@@ -648,13 +854,84 @@ async fn handle_event(event: Event, is_new: bool) {
                         };
 
                         // Add the reaction
-                        match state.add_reaction(npub, reference_id.to_string(), reaction) {
-                            true => {},
-                            false => (/* Couldn't find the relevant Profile or Message */)
+                        match state.add_reaction(contact, reference_id.to_string(), reaction) {
+                            true => {}
+                            false => (/* Couldn't find the relevant Profile or Message */),
                         }
                     }
                     None => (/* No Reference (Note ID) supplied */),
                 }
+            }
+            // Files and Images
+            else if rumor.kind == Kind::from_u16(15) {
+                // Extract our AES-GCM decryption key and nonce
+                let decryption_key = rumor.tags.find(TagKind::Custom(Cow::Borrowed("decryption-key"))).unwrap().content().unwrap();
+                let decryption_nonce = rumor.tags.find(TagKind::Custom(Cow::Borrowed("decryption-nonce"))).unwrap().content().unwrap();
+
+                // Extract the content storage URL
+                let content_url = rumor.content;
+
+                // Figure out the file extension from the mime-type
+                let mime_type = rumor.tags.find(TagKind::Custom(Cow::Borrowed("file-type"))).unwrap().content().unwrap();
+                let extension = match mime_type.split('/').nth(1) {
+                    Some("png") => "png",
+                    Some("jpeg") => "jpg",
+                    Some("jpg") => "jpg",
+                    Some("gif") => "gif",
+                    Some("webp") => "webp",
+                    Some(ext) => ext,
+                    None => "bin",
+                };
+
+                // Check if the file exists on our system already
+                let app_handle = TAURI_APP.get().unwrap().clone();
+                let dir = app_handle.path().resolve("vector", tauri::path::BaseDirectory::Download).unwrap();
+                let file_path = dir.join(format!("{}.{}", decryption_nonce, extension));
+                if !file_path.exists() {
+                    // No file! Try fetching it
+                    let req = reqwest::Client::new();
+                    let res = req.get(content_url.clone()).send().await;
+                    if res.is_err() {
+                        // TEMP: reaaaallly improve this area!
+                        print!("Weird file: {}", content_url);
+                        return;
+                    }
+                    let response = res.unwrap();
+                    let file_contents = response.bytes().await.unwrap().to_vec();
+
+                    // Decrypt the file
+                    let decrypted_file = decrypt_data(file_contents.as_slice(), decryption_key, decryption_nonce).unwrap();
+
+                    // Create the vector directory if it doesn't exist
+                    std::fs::create_dir_all(&dir).unwrap();
+
+                    // Save the file to disk
+                    std::fs::write(&file_path, &decrypted_file).unwrap();
+                }
+
+                // Create an attachment
+                let mut attachments = Vec::new();
+                let attachment = Attachment {
+                    id: decryption_nonce.to_string(),
+                    extension: extension.to_string(),
+                    path: file_path.to_string_lossy().to_string(),
+                    downloaded: true
+                };
+                attachments.push(attachment);
+
+                // Add the attachment to our state
+                let msg = Message {
+                    id: rumor.id.unwrap().to_hex(),
+                    content: String::new(),
+                    replied_to: String::new(),
+                    at: rumor.created_at.as_u64(),
+                    attachments: attachments,
+                    reactions: Vec::new(),
+                    mine: is_mine,
+                    pending: false,
+                    failed: false,
+                };
+                state.add_message(contact, msg);
             }
             // Vector-specific events (NIP-78)
             else if rumor.kind == Kind::ApplicationSpecificData {
@@ -668,26 +945,34 @@ async fn handle_event(event: Event, is_new: bool) {
                                 match rumor.tags.find(TagKind::Expiration) {
                                     Some(ex_tag) => {
                                         // And it must be within 30 seconds
-                                        let expiry_timestamp: u64 = ex_tag.content().unwrap().parse().unwrap_or(0);
+                                        let expiry_timestamp: u64 =
+                                            ex_tag.content().unwrap().parse().unwrap_or(0);
                                         // Check if the expiry timestamp is within 30 seconds from now (we'll say 35 to account for slight 'system time drift')
                                         let current_timestamp = std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-                                        if expiry_timestamp <= current_timestamp + 35 && expiry_timestamp > current_timestamp {
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_secs();
+                                        if expiry_timestamp <= current_timestamp + 35
+                                            && expiry_timestamp > current_timestamp
+                                        {
                                             // Now we apply the typing indicator to it's author profile
-                                            match state.get_profile_mut(rumor.pubkey.to_bech32().unwrap()) {
+                                            match state
+                                                .get_profile_mut(rumor.pubkey.to_bech32().unwrap())
+                                            {
                                                 Ok(profile) => {
                                                     profile.typing_until = expiry_timestamp;
                                                     state.has_state_changed = true;
-                                                },
-                                                Err(_) => { /* Received a Typing Indicator from an unknown contact, ignoring... */ }
+                                                }
+                                                Err(_) => { /* Received a Typing Indicator from an unknown contact, ignoring... */
+                                                }
                                             };
                                         }
-                                    },
+                                    }
                                     None => {}
                                 }
                             }
                         }
-                    },
+                    }
                     None => {}
                 }
             }
@@ -709,8 +994,8 @@ async fn notifs() -> Result<bool, String> {
 
     // Subscribe to the filter and begin handling incoming events
     match client.subscribe(filter, None).await {
-        Ok(_) => { /* Good! */ },
-        Err(e) => { return Err(e.to_string()) }
+        Ok(_) => { /* Good! */ }
+        Err(e) => return Err(e.to_string()),
     }
     match client
         .handle_notifications(|notification| async {
@@ -719,10 +1004,11 @@ async fn notifs() -> Result<bool, String> {
             }
             Ok(false)
         })
-        .await {
-            Ok(_) => Ok(true),
-            Err(e) => { Err(e.to_string()) }
-        }
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 #[tauri::command]
@@ -749,6 +1035,88 @@ fn show_notification(title: String, content: String) {
     }
 }
 
+/// Represents encryption parameters
+#[derive(Debug)]
+pub struct EncryptionParams {
+    pub key: String,    // Hex string
+    pub nonce: String,  // Hex string
+}
+
+/// Generates random encryption parameters (key and nonce)
+pub fn generate_encryption_params() -> EncryptionParams {
+    let mut rng = rand::thread_rng();
+    
+    // Generate 32 byte key (for AES-256)
+    let key: [u8; 32] = rng.gen();
+    // Generate 16 byte nonce (to match 0xChat)
+    let nonce: [u8; 16] = rng.gen();
+    
+    EncryptionParams {
+        key: hex::encode(key),
+        nonce: hex::encode(nonce),
+    }
+}
+
+/// Encrypts data using AES-256-GCM with a 16-byte nonce
+pub fn encrypt_data(data: &[u8], params: &EncryptionParams) -> Result<Vec<u8>, String> {
+    // Decode key and nonce from hex
+    let key_bytes = hex::decode(&params.key).unwrap();
+    let nonce_bytes = hex::decode(&params.nonce).unwrap();
+
+    // Initialize AES-GCM cipher
+    let cipher = AesGcm::<Aes256, U16>::new(
+        GenericArray::from_slice(&key_bytes)
+    );
+
+    // Prepare nonce
+    let nonce = GenericArray::from_slice(&nonce_bytes);
+
+    // Create output buffer
+    let mut buffer = data.to_vec();
+
+    // Encrypt in place and get authentication tag
+    let tag = cipher
+        .encrypt_in_place_detached(nonce, &[], &mut buffer)
+        .map_err(|_| String::from("Failed to Encrypt Data"))?;
+
+    // Append the authentication tag to the encrypted data
+    buffer.extend_from_slice(tag.as_slice());
+
+    Ok(buffer)
+}
+
+pub fn decrypt_data(encrypted_data: &[u8], key_hex: &str, nonce_hex: &str) -> Result<Vec<u8>, String> {
+    // Verify minimum size requirements
+    if encrypted_data.len() < 16 {
+        return Err(String::from("Invalid Input"));
+    }
+
+    // Decode key and nonce from hex
+    let key_bytes = hex::decode(key_hex).unwrap();
+    let nonce_bytes = hex::decode(nonce_hex).unwrap();
+
+    // Split input into ciphertext and authentication tag
+    let (ciphertext, tag_bytes) = encrypted_data.split_at(encrypted_data.len() - 16);
+
+    // Initialize AES-GCM cipher
+    let cipher = AesGcm::<Aes256, U16>::new(
+        GenericArray::from_slice(&key_bytes)
+    );
+
+    // Prepare nonce and tag
+    let nonce = GenericArray::from_slice(&nonce_bytes);
+    let tag = aes_gcm::Tag::from_slice(tag_bytes);
+
+    // Create output buffer
+    let mut buffer = ciphertext.to_vec();
+
+    // Perform decryption
+    cipher
+        .decrypt_in_place_detached(nonce, &[], &mut buffer, tag).unwrap();
+
+    Ok(buffer)
+}
+
 #[derive(serde::Serialize, Clone)]
 struct LoginKeyPair {
     public: String,
@@ -772,7 +1140,10 @@ async fn login(import_key: String) -> Result<LoginKeyPair, String> {
             // Simply return the same KeyPair and allow the frontend to continue login as usual
             // Note: we also say that the state has changed so that the frontend knows to refresh it's data
             STATE.lock().await.has_state_changed = true;
-            return Ok(LoginKeyPair { public: signer.get_public_key().await.unwrap().to_bech32().unwrap(), private: new_keys.secret_key().to_bech32().unwrap() });
+            return Ok(LoginKeyPair {
+                public: signer.get_public_key().await.unwrap().to_bech32().unwrap(),
+                private: new_keys.secret_key().to_bech32().unwrap(),
+            });
         } else {
             // This shouldn't happen in the real-world, but just in case...
             return Err(String::from("An existing Nostr Client instance exists, but a second incompatible key import was requested."));
@@ -783,13 +1154,13 @@ async fn login(import_key: String) -> Result<LoginKeyPair, String> {
     if import_key.starts_with("nsec") {
         match Keys::parse(&import_key) {
             Ok(parsed) => keys = parsed,
-            Err(_) => return Err(String::from("Invalid nsec"))
+            Err(_) => return Err(String::from("Invalid nsec")),
         };
     } else {
         // Otherwise, we'll try importing it as a mnemonic seed phrase (BIP-39)
         match Keys::from_mnemonic(import_key, Some(String::new())) {
             Ok(parsed) => keys = parsed,
-            Err(_) => return Err(String::from("Invalid Seed Phrase"))
+            Err(_) => return Err(String::from("Invalid Seed Phrase")),
         };
     }
 
@@ -808,7 +1179,10 @@ async fn login(import_key: String) -> Result<LoginKeyPair, String> {
     STATE.lock().await.profiles.push(profile);
 
     // Return our npub to the frontend client
-    Ok(LoginKeyPair { public: npub, private: keys.secret_key().to_bech32().unwrap() })
+    Ok(LoginKeyPair {
+        public: npub,
+        private: keys.secret_key().to_bech32().unwrap(),
+    })
 }
 
 #[tauri::command]
@@ -858,7 +1232,7 @@ fn bytes_to_hex_string(bytes: &[u8]) -> String {
 fn hex_string_to_bytes(s: &str) -> Vec<u8> {
     (0..s.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i+2], 16).unwrap())
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
         .collect()
 }
 
@@ -925,13 +1299,15 @@ async fn decrypt(ciphertext: String, password: String) -> Result<String, ()> {
     // Convert decrypted bytes back to string
     match String::from_utf8(buffer) {
         Ok(decrypted) => Ok(decrypted),
-        Err(_) => Err(())
+        Err(_) => Err(()),
     }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_store::Builder::new().build())
@@ -950,6 +1326,7 @@ pub fn run() {
             load_profile,
             update_profile,
             update_status,
+            upload_avatar,
             start_typing,
             connect,
             has_state_changed,

@@ -1,4 +1,4 @@
-const { invoke } = window.__TAURI__.core;
+const { invoke, convertFileSrc } = window.__TAURI__.core;
 const { getVersion } = window.__TAURI__.app;
 
 const domVersion = document.getElementById('version');
@@ -30,6 +30,7 @@ const domChatContactStatus = document.getElementById('chat-contact-status');
 const domChatMessages = document.getElementById('chat-messages');
 const domChatMessageBox = document.getElementById('chat-box');
 const domChatMessageInput = document.getElementById('chat-input');
+const domChatMessageInputFile = document.getElementById('chat-input-file');
 const domChatMessageInputCancel = document.getElementById('chat-input-cancel');
 const domChatMessageInputEmoji = document.getElementById('chat-input-emoji');
 
@@ -467,10 +468,11 @@ async function renderChatlist() {
  * Send a NIP-17 message to a Nostr user
  * @param {string} pubkey - The user's pubkey
  * @param {string} content - The content of the message
- * @param {string?} replied_to - The reference of the message
+ * @param {string?} replied_to - The reference of the message, if any
+ * @param {string?} file_path - The file to upload, if any
  */
-async function message(pubkey, content, replied_to) {
-    await invoke("message", { receiver: pubkey, content: content, repliedTo: replied_to });
+async function message(pubkey, content, replied_to, file_path) {
+    await invoke("message", { receiver: pubkey, content: content, repliedTo: replied_to, filePath: file_path });
 }
 
 /**
@@ -741,14 +743,23 @@ async function updateChat(contact, fSoft = false) {
                     // TODO: add ability to click it for a shortcut
                     const spanRef = document.createElement('span');
                     spanRef.classList.add('msg-reply');
-                    spanRef.textContent = cMsg.content.length < 100 ? cMsg.content : cMsg.content.substring(0, 100) + '…';
-                    pMessage.appendChild(spanRef);
+
+                    // Figure out the reply context
+                    if (cMsg.content) {
+                        // Reply to Text Message
+                        spanRef.textContent = cMsg.content.length < 100 ? cMsg.content : cMsg.content.substring(0, 100) + '…';
+                        pMessage.appendChild(spanRef);
+                    } else if (cMsg.attachments.length) {
+                        // Reply to Attachment
+                        spanRef.textContent = `Attachment`;
+                        pMessage.appendChild(spanRef);
+                    }
                 }
             }
 
-            // Render the text - if it's emoji-only, and less than four emojis, format them nicely
+            // Render the text - if it's emoji-only and/or file-only, and less than four emojis, format them nicely
             const spanMessage = document.createElement('span');
-            if (fEmojiOnly) {
+            if (fEmojiOnly || !msg.content) {
                 // Strip out unnecessary whitespace
                 spanMessage.textContent = strEmojiCleaned;
                 // Add an emoji-only CSS format
@@ -764,6 +775,28 @@ async function updateChat(contact, fSoft = false) {
 
             // Append the message contents
             pMessage.appendChild(spanMessage);
+
+            // Append attachments
+            for (const cAttachment of msg.attachments) {
+                if (cAttachment.downloaded) {
+                    // Convert the absolute file path to a Tauri asset
+                    const assetUrl = convertFileSrc(cAttachment.path);
+
+                    // Render the attachment appropriately for it's type
+                    if (['png', 'jpeg', 'jpg', 'gif', 'webp'].includes(cAttachment.extension)) {
+                        const imgPreview = document.createElement('img');
+                        imgPreview.style.width = `100%`;
+                        imgPreview.style.height = `auto`;
+                        imgPreview.style.borderRadius = `0`;
+                        imgPreview.src = assetUrl;
+                        pMessage.appendChild(imgPreview);
+                    } else {
+                        // Unknown attachment
+                    }
+                } else {
+                    // Display download prompt UI
+                }
+            }
 
             // If the message is pending or failed, let's adjust it
             if (msg.pending) {
@@ -1003,6 +1036,25 @@ window.addEventListener("DOMContentLoaded", async () => {
     };
     domChatMessageInputCancel.onclick = cancelReply;
 
+    // Hook up an in-chat File Upload listener
+    domChatMessageInputFile.onclick = async () => {
+        let filepath = await selectFile();
+        if (filepath) {
+            domChatMessageInput.setAttribute('placeholder', 'Uploading...');
+            try {
+                // Send the attachment file
+                await message(strOpenChat, "", strCurrentReplyReference, filepath);
+            } catch (e) {
+                // Notify of an attachment send failure
+                popupConfirm(e, '', true);
+            }
+
+            // Reset the placeholder and typing indicator timestamp
+            cancelReply();
+            nLastTypingIndicator = 0;
+        }
+    };
+
     // Hook up an 'Enter' listener on the Message Box for sending messages
     domChatMessageInput.onkeydown = async (evt) => {
         // Allow 'Shift + Enter' to create linebreaks, while only 'Enter' sends a message
@@ -1016,7 +1068,7 @@ window.addEventListener("DOMContentLoaded", async () => {
                 domChatMessageInput.value = '';
                 domChatMessageInput.setAttribute('placeholder', 'Sending...');
                 try {
-                    await message(strOpenChat, strMessage, strCurrentReplyReference);
+                    await message(strOpenChat, strMessage, strCurrentReplyReference, "");
                 } catch(_) {}
 
                 // Reset the placeholder and typing indicator timestamp
