@@ -1,5 +1,6 @@
 const { invoke, convertFileSrc } = window.__TAURI__.core;
 const { getVersion } = window.__TAURI__.app;
+const { getCurrentWebview } = window.__TAURI__.webview;
 
 const domVersion = document.getElementById('version');
 
@@ -425,6 +426,7 @@ async function renderChatlist() {
         divPreviewContainer.appendChild(h4ContactName);
 
         // Display either their Last Message or Typing Indicator
+        const cLastMsg = chat.messages[chat.messages.length - 1];
         const pChatPreview = document.createElement('p');
         pChatPreview.classList.add('cutoff');
         const fIsTyping = chat?.typing_until ? chat.typing_until > Date.now() / 1000 : false;
@@ -432,9 +434,11 @@ async function renderChatlist() {
         if (fIsTyping) {
             // Typing; display the glowy indicator!
             pChatPreview.textContent = `Typing...`;
+        } else if (!cLastMsg.content) {
+            // Not typing, and no text; display as an attachment
+            pChatPreview.textContent = (cLastMsg.mine ? 'You: ' : '') + 'Sent an attachment';
         } else {
             // Not typing; display their last message
-            const cLastMsg = chat.messages[chat.messages.length - 1];
             pChatPreview.textContent = (cLastMsg.mine ? 'You: ' : '') + cLastMsg.content;
         }
         divPreviewContainer.appendChild(pChatPreview);
@@ -476,6 +480,25 @@ async function message(pubkey, content, replied_to, file_path) {
 }
 
 /**
+ * Send a file via NIP-96 server to the current chat
+ * @param {string} filepath - The absolute file path
+ */
+async function sendFile(filepath) {
+    domChatMessageInput.setAttribute('placeholder', 'Uploading...');
+    try {
+        // Send the attachment file
+        await message(strOpenChat, "", strCurrentReplyReference, filepath);
+    } catch (e) {
+        // Notify of an attachment send failure
+        popupConfirm(e, '', true);
+    }
+
+    // Reset the placeholder and typing indicator timestamp
+    cancelReply();
+    nLastTypingIndicator = 0;
+}
+
+/**
  * Login to the Nostr network
  */
 async function login() {
@@ -506,6 +529,7 @@ async function login() {
         btnStartChat.textContent = "Start New Chat";
         btnStartChat.onclick = openNewChat;
         domChats.appendChild(btnStartChat);
+        adjustSize();
 
         // Setup a subscription for new websocket messages
         invoke("notifs");
@@ -669,8 +693,9 @@ let strCurrentReplyReference = "";
  * Updates the current chat (to display incoming and outgoing messages)
  * @param {string} contact 
  * @param {boolean} fSoft - Whether this is a soft update (i.e: status, typing indicator - no chat rendering)
+ * @param {boolean} fClicked - Whether the chat was opened manually or not
  */
-async function updateChat(contact, fSoft = false) {
+async function updateChat(contact, fSoft = false, fClicked = false) {
     const cProfile = arrChats.find(a => a.id === contact);
     if (cProfile?.messages.length) {
         // Prefer displaying their name, otherwise, npub
@@ -866,12 +891,15 @@ async function updateChat(contact, fSoft = false) {
             domChatMessages.appendChild(divMessage);
         }
 
-        // Auto-scroll on new messages
-        const cLastMsg = cProfile.messages[cProfile.messages.length - 1];
-        if (strLastMsgID !== cLastMsg.id) {
-            strLastMsgID = cLastMsg.id;
-            adjustSize();
-            domChatMessages.scrollTo(0, domChatMessages.scrollHeight);
+        // Auto-scroll on new messages (if the user hasn't scrolled up, or on manual chat open)
+        const pxFromBottom = domChatMessages.scrollHeight - domChatMessages.scrollTop - domChatMessages.clientHeight;
+        if (pxFromBottom < 250 || fClicked) {
+            const cLastMsg = cProfile.messages[cProfile.messages.length - 1];
+            if (strLastMsgID !== cLastMsg.id || fClicked) {
+                strLastMsgID = cLastMsg.id;
+                adjustSize();
+                domChatMessages.scrollTo(0, domChatMessages.scrollHeight);
+            }
         }
     } else {
         // Probably a 'New Chat', as such, we'll mostly render an empty chat
@@ -937,7 +965,7 @@ function openChat(contact) {
 
     // Render the current contact's messages
     strOpenChat = contact;
-    updateChat(contact);
+    updateChat(contact, false, true);
 }
 
 /**
@@ -1006,7 +1034,6 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (strTheme) {
         setTheme(strTheme);
     }
-    adjustSize();
 
     // If a local encrypted key exists, boot up the decryption UI
     if (await hasKey()) {
@@ -1040,20 +1067,41 @@ window.addEventListener("DOMContentLoaded", async () => {
     domChatMessageInputFile.onclick = async () => {
         let filepath = await selectFile();
         if (filepath) {
-            domChatMessageInput.setAttribute('placeholder', 'Uploading...');
-            try {
-                // Send the attachment file
-                await message(strOpenChat, "", strCurrentReplyReference, filepath);
-            } catch (e) {
-                // Notify of an attachment send failure
-                popupConfirm(e, '', true);
-            }
-
-            // Reset the placeholder and typing indicator timestamp
-            cancelReply();
-            nLastTypingIndicator = 0;
+            await sendFile(filepath);
         }
     };
+
+    // Hook up an in-chat File Paste listener
+    document.onpaste = async (evt) => {
+        if (strOpenChat) {
+            for (const item of evt.clipboardData.items) {
+                // Check if the pasted content is an image
+                if (item.type.startsWith('image/')) {
+                    const blob = item.getAsFile();
+                    if (blob) {
+                        const arrayBuffer = await blob.arrayBuffer();
+                        const uint8Array = new Uint8Array(arrayBuffer);
+
+                        // Placeholder
+                        domChatMessageInput.value = '';
+                        domChatMessageInput.setAttribute('placeholder', 'Sending...');
+
+                        // Send raw bytes to Rust
+                        await invoke('paste_message', {
+                            receiver: strOpenChat,
+                            repliedTo: strCurrentReplyReference,
+                            file: Array.from(uint8Array),
+                            mimeType: item.type
+                        });
+
+                        // Reset placeholder
+                        cancelReply();
+                        nLastTypingIndicator = 0;
+                    }
+                }
+            }
+        }
+    }
 
     // Hook up an 'Enter' listener on the Message Box for sending messages
     domChatMessageInput.onkeydown = async (evt) => {
@@ -1083,6 +1131,20 @@ window.addEventListener("DOMContentLoaded", async () => {
             }
         }
     };
+
+    // Hook up our drag-n-drop listeners
+    await getCurrentWebview().onDragDropEvent(async (event) => {
+        // Only accept File Drops if a chat is open
+        if (strOpenChat) {
+            if (event.payload.type === 'over') {
+                // TODO: add hover effects
+            } else if (event.payload.type === 'drop') {
+                await sendFile(event.payload.paths[0]);
+            } else {
+                // TODO: remove hover effects
+            }
+        }
+    });
 });
 
 /**
@@ -1092,6 +1154,11 @@ window.addEventListener("DOMContentLoaded", async () => {
  * affect the height and width of other components, too.
  */
 function adjustSize() {
+    // Chat List: resize the list to fit within the screen after the upper Account area
+    // Note: no idea why the `- 75px` is needed below, magic numbers, I guess.
+    const rectAccount = domAccount.getBoundingClientRect();
+    domChatList.style.maxHeight = (window.innerHeight - rectAccount.height) - 75 + `px`;
+
     // Chat Box: resize the chat to fill the remaining space after the upper Contact area (name)
     const rectContact = domChatContact.getBoundingClientRect();
     domChat.style.height = (window.innerHeight - rectContact.height) + `px`;

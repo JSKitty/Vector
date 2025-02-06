@@ -318,7 +318,23 @@ async fn message(receiver: String, content: String, replied_to: String, file_pat
                         .unwrap();
             let message = chat.get_message_mut(pending_id.clone()).unwrap();
             let msg_attachment: &mut Attachment = message.attachments.iter_mut().nth(0).unwrap();
+
+            // Store the nonce-based file name on-disk for future reference
+            let app_handle = TAURI_APP.get().unwrap().clone();
+            let dir = app_handle.path().resolve("vector", tauri::path::BaseDirectory::Download).unwrap();
+            let nonce_file_path = dir.join(format!("{}.{}", params.nonce.clone(), msg_attachment.extension.clone()));
+
+            // Create the vector directory if it doesn't exist
+            std::fs::create_dir_all(&dir).unwrap();
+
+            // Save the nonce-named file
+            std::fs::write(&nonce_file_path, &file).unwrap();
+
+            // Update ID
             msg_attachment.id = params.nonce.clone();
+
+            // Update file path
+            msg_attachment.path = nonce_file_path.to_string_lossy().to_string();
         }
 
         // Upload the attachment
@@ -364,7 +380,7 @@ async fn message(receiver: String, content: String, replied_to: String, file_pat
                     }
                 }
             },
-            Err(e) => return Err(String::from("Failed to sync server configuration"))
+            Err(_) => return Err(String::from("Failed to sync server configuration"))
         }
     };
 
@@ -435,6 +451,40 @@ async fn message(receiver: String, content: String, replied_to: String, file_pat
             return Ok(false);
         }
     }
+}
+
+#[tauri::command]
+async fn paste_message(receiver: String, replied_to: String, file: Vec<u8>, mime_type: String) -> Result<bool, String> {
+    // TODO: revamp the entire way we send files... the current method is clunky and highly limiting, hence this workaround
+    // Figure out the file extension from the mime-type
+    let extension = match mime_type.split('/').nth(1) {
+        Some("png") => "png",
+        Some("jpeg") => "jpg",
+        Some("jpg") => "jpg",
+        Some("gif") => "gif",
+        Some("webp") => "webp",
+        _ => return Err(String::from("Unsupported File Type!"))
+    };
+
+    // Check if the file exists on our system already
+    let app_handle = TAURI_APP.get().unwrap().clone();
+    let dir = app_handle.path().resolve("vector", tauri::path::BaseDirectory::Download).unwrap();
+    let file_path = dir.join(format!("tmp.{}", extension));
+
+    // Create the vector directory if it doesn't exist
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Temp save the file to disk
+    std::fs::write(&file_path, &file).unwrap();
+
+    // Message the file to the intended user
+    let msg_res = message(receiver, String::new(), replied_to, file_path.to_string_lossy().to_string()).await;
+
+    // Nuke the temporary save
+    std::fs::remove_file(file_path).unwrap();
+
+    // Return the message result
+    msg_res
 }
 
 #[tauri::command]
@@ -893,14 +943,19 @@ async fn handle_event(event: Event, is_new: bool) {
                     let res = req.get(content_url.clone()).send().await;
                     if res.is_err() {
                         // TEMP: reaaaallly improve this area!
-                        print!("Weird file: {}", content_url);
+                        println!("Weird file: {}", content_url);
                         return;
                     }
                     let response = res.unwrap();
                     let file_contents = response.bytes().await.unwrap().to_vec();
 
                     // Decrypt the file
-                    let decrypted_file = decrypt_data(file_contents.as_slice(), decryption_key, decryption_nonce).unwrap();
+                    let decryption = decrypt_data(file_contents.as_slice(), decryption_key, decryption_nonce);
+                    if decryption.is_err() {
+                        println!("Failed to decrypt: {}", content_url);
+                        return;
+                    }
+                    let decrypted_file = decryption.unwrap();
 
                     // Create the vector directory if it doesn't exist
                     std::fs::create_dir_all(&dir).unwrap();
@@ -1111,8 +1166,13 @@ pub fn decrypt_data(encrypted_data: &[u8], key_hex: &str, nonce_hex: &str) -> Re
     let mut buffer = ciphertext.to_vec();
 
     // Perform decryption
-    cipher
-        .decrypt_in_place_detached(nonce, &[], &mut buffer, tag).unwrap();
+    let decryption = cipher
+        .decrypt_in_place_detached(nonce, &[], &mut buffer, tag);
+
+    // Check that it went well
+    if decryption.is_err() {
+        return Err(decryption.unwrap_err().to_string());
+    }
 
     Ok(buffer)
 }
@@ -1237,10 +1297,10 @@ fn hex_string_to_bytes(s: &str) -> Vec<u8> {
 }
 
 async fn hash_pass(password: String) -> [u8; 32] {
-    // 75000 KiB memory size
-    let memory = 75000;
-    // 5 iterations
-    let iterations = 5;
+    // 150000 KiB memory size
+    let memory = 150000;
+    // 10 iterations
+    let iterations = 10;
     let params = Params::new(memory, iterations, 1, Some(32)).unwrap();
 
     // TODO: create a random on-disk salt at first init
@@ -1320,6 +1380,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             fetch_messages,
             message,
+            paste_message,
             react,
             login,
             notifs,
