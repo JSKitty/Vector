@@ -365,6 +365,8 @@ async function fetchProfiles() {
  * A "thread" function dedicated to rendering the Chat UI in real-time
  */
 function renderChatlist() {
+    if (fInit) return;
+
     // Check if the order of chats has changed
     const currentOrder = Array.from(domChatList.children).map(el => el.id.replace('chatlist-', ''));
     const orderChanged = JSON.stringify(currentOrder) !== JSON.stringify(arrChats.map(chat => chat.id));
@@ -489,6 +491,11 @@ async function setupRustListeners() {
         if (nProfileIdx >= 0) {
             // Update our frontend memory
             arrChats[nProfileIdx] = evt.payload;
+
+            // If this is our profile, make sure to render it's changes
+            if (arrChats[nProfileIdx].mine) {
+                renderCurrentProfile(arrChats[nProfileIdx]);
+            }
         } else {
             // Add the new profile
             arrChats.unshift(evt.payload);
@@ -569,6 +576,11 @@ async function setupRustListeners() {
 }
 
 /**
+ * A flag that indicates when Vector is still in it's initiation sequence
+ */
+let fInit = true;
+
+/**
  * Login to the Nostr network
  */
 async function login() {
@@ -598,6 +610,9 @@ async function login() {
         // Render our profile
         const cProfile = arrChats.find(p => p.mine);
         renderCurrentProfile(cProfile);
+
+        // Finished boot!
+        fInit = false;
 
         // Render the chatlist
         renderChatlist();
