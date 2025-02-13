@@ -175,7 +175,7 @@ body {
 }
 
 #chat-new {
-  padding: 5px;
+  padding: 30px;
 }
 
 .chats {
@@ -255,7 +255,7 @@ body {
 
 .msg-me p {
   text-align: left;
-  max-width: 300px;
+  max-width: 500px;
   border-radius: 15px;
   border-style: solid;
   border-width: 1px;
@@ -266,7 +266,7 @@ body {
 
 .msg-them p {
   text-align: left;
-  max-width: 300px;
+  max-width: 500px;
   border-radius: 15px;
   border-style: solid;
   border-width: 1px;
@@ -294,6 +294,11 @@ body {
 .emoji-only-content {
   font-size: 75px;
   line-height: 75px;
+}
+
+.no-background {
+  background: none !important;
+  border-color: transparent !important;
 }
 
 .msg-them {
@@ -452,15 +457,16 @@ button {
 
 select {
   width: 150px;
-  font-size: 150px;
+  font-size: large;
 }
 
 button {
+  backdrop-filter: blur(6px);
   cursor: pointer;
 }
 
 button:active {
-  background-color: #0f0f0f69;
+  opacity: 0.75;
 }
 
 .btn {
@@ -469,6 +475,22 @@ button:active {
 
 .btn:hover {
   opacity: 0.75;
+}
+
+.corner-float {
+  bottom: 80px;
+  right: 20px;
+  position: absolute;
+  padding: 2.5px 12.5px;
+  font-size: 30px;
+  transform: scale(0) translateY(50px);
+  transition-property: transform;
+  transition-duration: 0.4s;
+  transition-timing-function: cubic-bezier(0.95, 0.05, 0.795, 0.035);
+}
+
+.corner-float.visible {
+  transform: scale(1) translateY(0px);
 }
 
 .divider {

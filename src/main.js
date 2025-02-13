@@ -31,6 +31,7 @@ const domChatContact = document.getElementById('chat-contact');
 const domChatContactStatus = document.getElementById('chat-contact-status');
 const domChatMessages = document.getElementById('chat-messages');
 const domChatMessageBox = document.getElementById('chat-box');
+const domChatMessagesScrollReturnBtn = document.getElementById('chat-scroll-return');
 const domChatMessageInput = document.getElementById('chat-input');
 const domChatMessageInputFile = document.getElementById('chat-input-file');
 const domChatMessageInputCancel = document.getElementById('chat-input-cancel');
@@ -455,21 +456,22 @@ function renderContact(chat) {
  * @param {string} pubkey - The user's pubkey
  * @param {string} content - The content of the message
  * @param {string?} replied_to - The reference of the message, if any
- * @param {string?} file_path - The file to upload, if any
  */
-async function message(pubkey, content, replied_to, file_path) {
-    await invoke("message", { receiver: pubkey, content: content, repliedTo: replied_to, filePath: file_path });
+async function message(pubkey, content, replied_to) {
+    await invoke("message", { receiver: pubkey, content: content, repliedTo: replied_to });
 }
 
 /**
- * Send a file via NIP-96 server to the current chat
+ * Send a file via NIP-96 server to a Nostr user
+ * @param {string} pubkey - The user's pubkey
+ * @param {string?} replied_to - The reference of the message, if any
  * @param {string} filepath - The absolute file path
  */
-async function sendFile(filepath) {
+async function sendFile(pubkey, replied_to, filepath) {
     domChatMessageInput.setAttribute('placeholder', 'Uploading...');
     try {
         // Send the attachment file
-        await message(strOpenChat, "", strCurrentReplyReference, filepath);
+        await invoke("file_message", { receiver: pubkey, repliedTo: replied_to, filePath: filepath });
     } catch (e) {
         // Notify of an attachment send failure
         popupConfirm(e, '', true);
@@ -619,7 +621,10 @@ async function login() {
 
         // Append a "Start New Chat" button
         const btnStartChat = document.createElement('button');
-        btnStartChat.textContent = "Start New Chat";
+        btnStartChat.classList.add('corner-float', 'visible');
+        btnStartChat.style.bottom = `15px`;
+        btnStartChat.style.borderRadius = `100%`;
+        btnStartChat.textContent = "+";
         btnStartChat.onclick = openNewChat;
         domChats.appendChild(btnStartChat);
         adjustSize();
@@ -805,8 +810,8 @@ async function updateChat(profile, arrMessages = [], fClicked = false) {
         if (!arrMessages.length) return;
 
         // Efficiently append or prepend messages based on their time relative to the chat
-        const cLastRenderedMessage = profile.messages.find(m => m.id === domChatMessages?.lastElementChild?.id);
-        let nLastMsgTime = cLastRenderedMessage?.at || Date.now() / 1000;
+        let cLastMsg = arrMessages.length > 1 ? arrMessages[0] : profile.messages.find(m => m.id === domChatMessages?.lastElementChild?.id);
+        let nLastMsgTime = cLastMsg?.at || Date.now() / 1000;
         for (const msg of arrMessages) {
             // If the last message was over 10 minutes ago, add an inline timestamp
             if (msg.at - nLastMsgTime > 600) {
@@ -827,7 +832,7 @@ async function updateChat(profile, arrMessages = [], fClicked = false) {
             }
 
             const domMsg = renderMessage(msg, profile);
-            if (!cLastRenderedMessage || cLastRenderedMessage.at < msg.at) {
+            if (!cLastMsg || cLastMsg.at < msg.at) {
                 // If the message is newer than the last, append it
                 domChatMessages.appendChild(domMsg);
             } else {
@@ -917,7 +922,7 @@ function renderMessage(msg, sender) {
 
     // Render the text - if it's emoji-only and/or file-only, and less than four emojis, format them nicely
     const spanMessage = document.createElement('span');
-    if (fEmojiOnly || !msg.content) {
+    if (fEmojiOnly) {
         // Strip out unnecessary whitespace
         spanMessage.textContent = strEmojiCleaned;
         // Add an emoji-only CSS format
@@ -935,6 +940,12 @@ function renderMessage(msg, sender) {
     pMessage.appendChild(spanMessage);
 
     // Append attachments
+    if (msg.attachments.length) {
+        // Float the content depending on who's it is
+        pMessage.style.float = msg.mine ? 'right' : 'left';
+        // Remove any message bubbles
+        pMessage.classList.add('no-background');
+    }
     for (const cAttachment of msg.attachments) {
         if (cAttachment.downloaded) {
             // Convert the absolute file path to a Tauri asset
@@ -942,14 +953,33 @@ function renderMessage(msg, sender) {
 
             // Render the attachment appropriately for it's type
             if (['png', 'jpeg', 'jpg', 'gif', 'webp'].includes(cAttachment.extension)) {
+                // Images
                 const imgPreview = document.createElement('img');
                 imgPreview.style.width = `100%`;
                 imgPreview.style.height = `auto`;
                 imgPreview.style.borderRadius = `0`;
                 imgPreview.src = assetUrl;
                 pMessage.appendChild(imgPreview);
+            } else if (['mp4', 'mov', 'webm'].includes(cAttachment.extension)) {
+                // Videos
+                const vidPreview = document.createElement('video');
+                vidPreview.setAttribute('controlsList', 'nodownload');
+                vidPreview.setAttribute("controls", "controls");
+                vidPreview.style.width = `100%`;
+                vidPreview.style.height = `auto`;
+                vidPreview.style.borderRadius = `0`;
+                vidPreview.style.cursor = `pointer`;
+                vidPreview.loop = true;
+                vidPreview.preload = true;
+                vidPreview.playsInline = true;
+                vidPreview.src = assetUrl;
+                pMessage.appendChild(vidPreview);
             } else {
                 // Unknown attachment
+                const iUnknown = document.createElement('i');
+                iUnknown.classList.add('text-gradient');
+                iUnknown.textContent = `Previews not supported for "${cAttachment.extension}" files yet`;
+                pMessage.appendChild(iUnknown);
             }
         } else {
             // Display download prompt UI
@@ -1177,11 +1207,14 @@ window.addEventListener("DOMContentLoaded", async () => {
     };
     domChatMessageInputCancel.onclick = cancelReply;
 
+    // Hook up a scroll handler in the chat to display UI elements at certain scroll depths
+    createScrollHandler(domChatMessages, domChatMessagesScrollReturnBtn, { threshold: 500 })
+
     // Hook up an in-chat File Upload listener
     domChatMessageInputFile.onclick = async () => {
         let filepath = await selectFile();
         if (filepath) {
-            await sendFile(filepath);
+            await sendFile(strOpenChat, strCurrentReplyReference, filepath);
         }
     };
 
@@ -1193,9 +1226,6 @@ window.addEventListener("DOMContentLoaded", async () => {
                 if (item.type.startsWith('image/')) {
                     const blob = item.getAsFile();
                     if (blob) {
-                        const arrayBuffer = await blob.arrayBuffer();
-                        const uint8Array = new Uint8Array(arrayBuffer);
-
                         // Placeholder
                         domChatMessageInput.value = '';
                         domChatMessageInput.setAttribute('placeholder', 'Sending...');
@@ -1204,7 +1234,8 @@ window.addEventListener("DOMContentLoaded", async () => {
                         await invoke('paste_message', {
                             receiver: strOpenChat,
                             repliedTo: strCurrentReplyReference,
-                            file: Array.from(uint8Array),
+                            // Convert our File Blob to a plain byte array that Tauri can handle
+                            bytes: [...new Uint8Array(await blob.arrayBuffer())],
                             mimeType: item.type
                         });
 
@@ -1253,7 +1284,7 @@ window.addEventListener("DOMContentLoaded", async () => {
             if (event.payload.type === 'over') {
                 // TODO: add hover effects
             } else if (event.payload.type === 'drop') {
-                await sendFile(event.payload.paths[0]);
+                await sendFile(strOpenChat, strCurrentReplyReference, event.payload.paths[0]);
             } else {
                 // TODO: remove hover effects
             }
@@ -1269,9 +1300,9 @@ window.addEventListener("DOMContentLoaded", async () => {
  */
 function adjustSize() {
     // Chat List: resize the list to fit within the screen after the upper Account area
-    // Note: no idea why the `- 75px` is needed below, magic numbers, I guess.
+    // Note: no idea why the `- 30px` is needed below, magic numbers, I guess.
     const rectAccount = domAccount.getBoundingClientRect();
-    domChatList.style.maxHeight = (window.innerHeight - rectAccount.height) - 75 + `px`;
+    domChatList.style.maxHeight = (window.innerHeight - rectAccount.height) - 30 + `px`;
 
     // Chat Box: resize the chat to fill the remaining space after the upper Contact area (name)
     const rectContact = domChatContact.getBoundingClientRect();
