@@ -2,6 +2,7 @@ const { invoke, convertFileSrc } = window.__TAURI__.core;
 const { getVersion } = window.__TAURI__.app;
 const { getCurrentWebview } = window.__TAURI__.webview;
 const { listen } = window.__TAURI__.event;
+const { readImage } = window.__TAURI__.clipboardManager;
 
 const domVersion = document.getElementById('version');
 
@@ -36,6 +37,7 @@ const domChatMessageInput = document.getElementById('chat-input');
 const domChatMessageInputFile = document.getElementById('chat-input-file');
 const domChatMessageInputCancel = document.getElementById('chat-input-cancel');
 const domChatMessageInputEmoji = document.getElementById('chat-input-emoji');
+const domChatMessageInputVoice = document.getElementById('chat-input-voice');
 
 const domChatNew = document.getElementById('chat-new');
 const domChatNewBackBtn = document.getElementById('chat-new-back-btn');
@@ -960,17 +962,23 @@ function renderMessage(msg, sender) {
                 imgPreview.style.borderRadius = `0`;
                 imgPreview.src = assetUrl;
                 pMessage.appendChild(imgPreview);
+            } else if (['wav', 'mp3'].includes(cAttachment.extension)) {
+                // Audio
+                const audPreview = document.createElement('audio');
+                audPreview.controls = true;
+                audPreview.preload = 'metadata';
+                audPreview.src = assetUrl;
+                pMessage.appendChild(audPreview);
             } else if (['mp4', 'mov', 'webm'].includes(cAttachment.extension)) {
                 // Videos
                 const vidPreview = document.createElement('video');
                 vidPreview.setAttribute('controlsList', 'nodownload');
-                vidPreview.setAttribute("controls", "controls");
+                vidPreview.controls = true;
                 vidPreview.style.width = `100%`;
                 vidPreview.style.height = `auto`;
                 vidPreview.style.borderRadius = `0`;
                 vidPreview.style.cursor = `pointer`;
-                vidPreview.loop = true;
-                vidPreview.preload = true;
+                vidPreview.preload = "metadata";
                 vidPreview.playsInline = true;
                 vidPreview.src = assetUrl;
                 pMessage.appendChild(vidPreview);
@@ -1224,19 +1232,23 @@ window.addEventListener("DOMContentLoaded", async () => {
             for (const item of evt.clipboardData.items) {
                 // Check if the pasted content is an image
                 if (item.type.startsWith('image/')) {
-                    const blob = item.getAsFile();
+                    const blob = await readImage();
                     if (blob) {
                         // Placeholder
                         domChatMessageInput.value = '';
                         domChatMessageInput.setAttribute('placeholder', 'Sending...');
 
+                        // Convert Tauri Clipboard blob to image components
+                        const rgba = await blob.rgba();
+                        const size = await blob.size();
+
                         // Send raw bytes to Rust
                         await invoke('paste_message', {
                             receiver: strOpenChat,
                             repliedTo: strCurrentReplyReference,
-                            // Convert our File Blob to a plain byte array that Tauri can handle
-                            bytes: [...new Uint8Array(await blob.arrayBuffer())],
-                            mimeType: item.type
+                            pixels: rgba,
+                            width: size.width,
+                            height: size.height
                         });
 
                         // Reset placeholder
@@ -1288,6 +1300,54 @@ window.addEventListener("DOMContentLoaded", async () => {
             } else {
                 // TODO: remove hover effects
             }
+        }
+    });
+
+    // Initialize
+    const recorder = new VoiceRecorder(domChatMessageInputVoice);
+
+    // Example: Playing the recorded WAV
+    recorder.button.addEventListener('click', async () => {
+        if (recorder.isRecording) {
+            // Stop the recording and retrieve our WAV data
+            const wavData = await recorder.stop();
+
+            // Unhide our messaging UI
+            domChatMessageInputFile.style.display = '';
+            domChatMessageInput.style.display = '';
+            domChatMessageInputEmoji.style.display = '';
+            if (wavData) {
+                // Placeholder
+                domChatMessageInput.value = '';
+                domChatMessageInput.setAttribute('placeholder', 'Sending...');
+
+                // Send raw bytes to Rust, if the chat is still open
+                // Note: since the user could, for some reason, close the chat while recording - we need to check that it's still open
+                if (strOpenChat) {
+                    try {
+                        await invoke('voice_message', {
+                            receiver: strOpenChat,
+                            repliedTo: strCurrentReplyReference,
+                            bytes: wavData
+                        });
+                    } catch (e) {
+                        // Notify of an attachment send failure
+                        popupConfirm(e, '', true);
+                    }
+
+                    // Reset placeholder
+                    cancelReply();
+                    nLastTypingIndicator = 0;
+                }
+            }
+        } else {
+            // Hide our messaging UI
+            domChatMessageInputFile.style.display = 'none';
+            domChatMessageInput.style.display = 'none';
+            domChatMessageInputEmoji.style.display = 'none';
+
+            // Start recording
+            await recorder.start();
         }
     });
 });

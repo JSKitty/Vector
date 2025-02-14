@@ -13,10 +13,13 @@ use aes_gcm::{
     AesGcm,
 };
 use generic_array::{GenericArray, typenum::U16};
-
+use ::image::{ImageEncoder, codecs::png::PngEncoder, ExtendedColorType::Rgba8};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_fs::FsExt;
+
+mod voice;
+use voice::AudioRecorder;
 
 /// # Trusted Relay
 ///
@@ -382,6 +385,9 @@ async fn message(receiver: String, content: String, replied_to: String, file: Op
                     "jpg" | "jpeg" => "image/jpeg",
                     "gif" => "image/gif",
                     "webp" => "image/webp",
+                    // Audio
+                    "wav" => "audio/wav",
+                    "mp3" => "audio/mp3",
                     // Videos
                     "mp4" => "video/mp4",
                     "webm" => "video/webm",
@@ -504,14 +510,35 @@ async fn message(receiver: String, content: String, replied_to: String, file: Op
 }
 
 #[tauri::command]
-async fn paste_message(receiver: String, replied_to: String, bytes: Vec<u8>, mime_type: String) -> Result<bool, String> {
-    // Figure out the file extension from the mime-type
-    let ext = mime_type.split('/').nth(1).unwrap_or("");
+async fn paste_message(receiver: String, replied_to: String, pixels: Vec<u8>, width: u32, height: u32) -> Result<bool, String> {
+    // Create the encoder directly with a Vec<u8>
+    let mut png_data = Vec::new();
+    let encoder = PngEncoder::new(&mut png_data);
+
+    // Encode directly from pixels to PNG bytes
+    encoder.write_image(
+        &pixels,            // raw pixels
+        width,              // width
+        height,             // height
+        Rgba8               // color type
+    ).map_err(|e| e.to_string()).unwrap();
 
     // Generate an Attachment File
     let attachment_file = AttachmentFile {
+        bytes: png_data,
+        extension: String::from("png")
+    };
+
+    // Message the file to the intended user
+    message(receiver, String::new(), replied_to, Some(attachment_file)).await
+}
+
+#[tauri::command]
+async fn voice_message(receiver: String, replied_to: String, bytes: Vec<u8>) -> Result<bool, String> {
+    // Generate an Attachment File
+    let attachment_file = AttachmentFile {
         bytes,
-        extension: ext.to_string()
+        extension: String::from("wav")
     };
 
     // Message the file to the intended user
@@ -997,6 +1024,11 @@ async fn handle_event(event: Event, is_new: bool) {
                     Some("jpg") => "jpg",
                     Some("gif") => "gif",
                     Some("webp") => "webp",
+                    // Audio
+                    Some("wav") => "wav",
+                    Some("x-wav") => "wav",
+                    Some("wave") => "wav",
+                    Some("mp3") => "mp3",
                     // Videos
                     Some("mp4") => "mp4",
                     Some("webm") => "webm",
@@ -1442,9 +1474,20 @@ async fn decrypt(ciphertext: String, password: String) -> Result<String, ()> {
     }
 }
 
+#[tauri::command]
+async fn start_recording() -> Result<(), String> {
+    AudioRecorder::global().start()
+}
+
+#[tauri::command]
+async fn stop_recording() -> Result<Vec<u8>, String> {
+    AudioRecorder::global().stop()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -1481,6 +1524,7 @@ pub fn run() {
             fetch_messages,
             message,
             paste_message,
+            voice_message,
             file_message,
             react,
             login,
@@ -1492,7 +1536,9 @@ pub fn run() {
             start_typing,
             connect,
             encrypt,
-            decrypt
+            decrypt,
+            start_recording,
+            stop_recording
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
