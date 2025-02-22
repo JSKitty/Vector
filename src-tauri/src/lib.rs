@@ -16,6 +16,7 @@ use generic_array::{GenericArray, typenum::U16};
 use ::image::{ImageEncoder, codecs::png::PngEncoder, ExtendedColorType::Rgba8};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
+use tauri_plugin_fs::FsExt;
 use scraper::{Html, Selector};
 
 mod util;
@@ -1642,7 +1643,7 @@ pub async fn fetch_site_metadata(url: &str) -> Result<SiteMetadata, String> {
         // 5. fallback to /favicon.ico
         
         let favicon = favicon_candidates.iter()
-            .find(|(url, rel)| 
+            .find(|(_url, rel)| 
                 rel == "apple-touch-icon")
             .or_else(|| 
                 favicon_candidates.iter()
