@@ -3,6 +3,7 @@ const { getVersion } = window.__TAURI__.app;
 const { getCurrentWebview } = window.__TAURI__.webview;
 const { listen } = window.__TAURI__.event;
 const { readImage } = window.__TAURI__.clipboardManager;
+const { openUrl } = window.__TAURI__.opener;
 
 const domVersion = document.getElementById('version');
 
@@ -579,7 +580,7 @@ async function setupRustListeners() {
             // If the old ID was a pending ID (our message), make sure to update and scroll accordingly
             if (evt.payload.old_id.startsWith('pending')) {
                 strLastMsgID = evt.payload.message.id;
-                scrollToBottom(domChatMessages, false);
+                softChatScroll();
             }
         }
 
@@ -869,6 +870,7 @@ async function updateChat(profile, arrMessages = [], fClicked = false) {
             if (strLastMsgID !== cLastMsg.id || fClicked) {
                 strLastMsgID = cLastMsg.id;
                 adjustSize();
+                // Force an auto-scroll, given soft-scrolling won't accurately work when the entire list has just rendered
                 scrollToBottom(domChatMessages, false);
             }
         }
@@ -899,6 +901,7 @@ function renderMessage(msg, sender) {
     // Render their avatar, if they have one
     if (!msg.mine && sender?.avatar) {
         const imgAvatar = document.createElement('img');
+        imgAvatar.classList.add('avatar');
         imgAvatar.src = sender.avatar;
         divMessage.appendChild(imgAvatar);
     }
@@ -988,7 +991,7 @@ function renderMessage(msg, sender) {
                 // When the metadata loads, we run some maintenance tasks
                 audPreview.addEventListener('loadedmetadata', () => {
                     // Auto-scroll to correct against the longer container
-                    scrollToBottom(domChatMessages, false);
+                    softChatScroll();
                 }, { once: true });
                 pMessage.appendChild(audPreview);
             } else if (['mp4', 'mov', 'webm'].includes(cAttachment.extension)) {
@@ -1008,7 +1011,7 @@ function renderMessage(msg, sender) {
                     // Seek a tiny amount to force the frame 'poster' to load, without loading the entire video
                     vidPreview.currentTime = 0.1;
                     // Auto-scroll to correct against the longer container
-                    scrollToBottom(domChatMessages, false);
+                    softChatScroll();
                 }, { once: true });
                 pMessage.appendChild(vidPreview);
             } else {
@@ -1020,6 +1023,44 @@ function renderMessage(msg, sender) {
             }
         } else {
             // Display download prompt UI
+        }
+    }
+
+    // Append Metadata Previews (i.e: OpenGraph data from URLs, etc)
+    if (!msg.pending && !msg.failed) {
+        if (msg.preview_metadata?.og_image) {
+            // Setup the Preview container
+            const divPrevContainer = document.createElement('div');
+            divPrevContainer.classList.add('msg-preview-container', 'btn');
+            divPrevContainer.setAttribute('url', msg.preview_metadata.og_url || msg.preview_metadata.domain);
+
+            // Setup the Favicon
+            const imgFavicon = document.createElement('img');
+            imgFavicon.classList.add('favicon');
+            imgFavicon.src = msg.preview_metadata.favicon;
+
+            // Add the title (prefixed with the Favicon)
+            const spanPreviewTitle = document.createElement('span');
+            spanPreviewTitle.appendChild(imgFavicon);
+            const spanText = document.createTextNode(msg.preview_metadata.title || msg.preview_metadata.og_title);
+            spanPreviewTitle.appendChild(spanText);
+            divPrevContainer.appendChild(spanPreviewTitle);
+
+            // Load the Preview image
+            const imgPreview = document.createElement('img');
+            imgPreview.classList.add('msg-preview-img');
+            imgPreview.src = msg.preview_metadata.og_image;
+            // Auto-scroll the chat to correct against container resizes
+            imgPreview.addEventListener('load', softChatScroll, { once: true });
+            divPrevContainer.appendChild(imgPreview);
+
+            // Render the Preview
+            pMessage.appendChild(divPrevContainer);
+        } else if (!msg.preview_metadata) {
+            // Check if message is older than 6 hours, then try to sync metadata
+            if (msg.at > (Date.now() / 1000) - 21600) {
+                invoke("fetch_msg_metadata", { npub: sender.id, msg: msg.id });
+            }
         }
     }
 
@@ -1419,6 +1460,13 @@ document.addEventListener('click', (e) => {
         return setTimeout(() => domMsg.classList.remove('highlight-animation'), 1500);
     }
 
+    // If we're clicking a Metadata Preview, open it's URL, if one is attached
+    if (e.target.classList.contains("msg-preview-container") || e.target.parentElement?.classList.contains("msg-preview-container")) {
+        const strURL = e.target.getAttribute('url') || e.target.parentElement.getAttribute('url');
+        if (strURL) openUrl(strURL);
+        return;
+    }
+
     // If we're clicking a Contact, open the chat with the embedded npub (ID)
     if (e.target.classList.contains("chatlist-contact")) return openChat(e.target.id);
 
@@ -1441,6 +1489,18 @@ function adjustSize() {
     // Chat Box: resize the chat to fill the remaining space after the upper Contact area (name)
     const rectContact = domChatContact.getBoundingClientRect();
     domChat.style.height = (window.innerHeight - rectContact.height) + `px`;
+
+    // If the chat is open, and they've not significantly scrolled up: auto-scroll down to correct against container resizes
+    softChatScroll();
+}
+
+/**
+ * Scrolls the chat to the bottom if the user has not already scrolled upwards substantially.
+ * 
+ * This is used to correct against container resizes, i.e: if an image loads, or a message is received.
+ */
+function softChatScroll() {
+    if (!strOpenChat) return;
 
     // If the chat is open, and they've not significantly scrolled up: auto-scroll down to correct against container resizes
     const pxFromBottom = domChatMessages.scrollHeight - domChatMessages.scrollTop - domChatMessages.clientHeight;
