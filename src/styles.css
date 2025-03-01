@@ -136,6 +136,12 @@ body {
   animation: BreathingGradient 6s cubic-bezier(.46,.03,.52,.96) infinite;
 }
 
+.startup-subtext-gradient {
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: BreathingGradient 6s cubic-bezier(.46,.03,.52,.96) infinite;
+}
+
 @keyframes BreathingGradient {
   0% {background-position: 0% 50%;}
   50% {background-position: 100% 50%;}
@@ -151,8 +157,11 @@ body {
 
 .pin-row input {
   text-align: center;
-  width: 10px;
+  width: 40px;
+  height: 40px;
   margin: 5px;
+  padding: 0;
+  background-color: black;
 }
 
 .intro-anim {
@@ -161,6 +170,22 @@ body {
 
 @keyframes Intro {
   0% { opacity: 0; transform: translateY(50px); }
+}
+
+.fadeout-anim {
+  animation: Fadeout 0.5s cubic-bezier(.46,.03,.52,.96) forwards;
+}
+
+@keyframes Fadeout {
+  100% { opacity: 0; }
+}
+
+.fadein-anim {
+  animation: Fadein 0.5s cubic-bezier(.46,.03,.52,.96) forwards;
+}
+
+@keyframes Fadein {
+  0% { opacity: 0; }
 }
 
 .intro-anim-widen {
@@ -370,6 +395,27 @@ body {
   padding-left: 10px;
   opacity: 0.6;
   margin-bottom: 5px;
+}
+
+.msg-payment {
+  display: flex;
+  padding: 10px;
+  border-radius: 16px;
+  margin-top: 10px;
+  border-style: solid;
+  border-width: 1px;
+}
+
+.msg-payment img {
+  height: 50px;
+  margin-top: auto;
+  margin-bottom: auto;
+  margin-right: 10px;
+}
+
+.msg-payment button {
+  margin-left: auto;
+  background-color: rgba(0, 0, 0, 0.4);
 }
 
 /* The `highlightMessage` animation is defined in `/themes/*` */
