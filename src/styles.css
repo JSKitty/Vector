@@ -51,6 +51,10 @@
   mask-image: url("./icons/wink-face.svg");
 }
 
+.icon-reply {
+  mask-image: url("./icons/reply.svg");
+}
+
 .icon-chevron-down {
   mask-image: url("./icons/chevron-down.svg");
 }
@@ -345,6 +349,16 @@ body {
   font-family: 'Rubik';
 }
 
+.chat-messages > div:first-child {
+  /* The first message should have extra margin from the top */
+  margin-top: 15px;
+}
+
+.chat-messages > div:last-child {
+  /* The last message should have extra margin from the bottom */
+  margin-bottom: 15px;
+}
+
 .msg-inline-timestamp {
   width: 100%;
   text-align: center;
@@ -361,6 +375,10 @@ body {
   object-position: center;
   height: 50px;
   width: 50px;
+  min-width: 50px;
+  min-height: 50px;
+  max-width: 50px;
+  max-height: 50px;
   border-radius: 100%;
   margin-top: 15px;
   margin-right: 10px;
@@ -372,7 +390,9 @@ body {
   border-radius: 15px;
   border-style: solid;
   border-width: 1px;
-  padding: 12px;
+  padding: 12px 15px;
+  margin-top: 0;
+  margin-bottom: 6px;
   border-bottom-right-radius: 0px;
   word-break: break-word;
   font-weight: 100;
@@ -384,16 +404,23 @@ body {
   border-radius: 15px;
   border-style: solid;
   border-width: 1px;
-  padding: 12px;
+  padding: 12px 15px;
+  margin-top: 0;
+  margin-bottom: 6px;
   border-bottom-left-radius: 0px;
   word-break: break-word;
   font-weight: 100;
+}
+
+.msg-them .avatar {
+  margin-top: 0;
 }
 
 .msg-reply {
   display: block;
   padding-left: 10px;
   margin-bottom: 5px;
+  line-height: 20px;
 }
 
 .msg-payment {
@@ -520,7 +547,11 @@ body {
 }
 
 .msg-extras span {
+  position: relative;
   cursor: pointer;
+  height: 20px;
+  width: 20px;
+  margin: 3px;
 }
 
 .msg-extras .hideable {
@@ -535,8 +566,8 @@ body {
 .reaction {
   cursor: default;
   position: relative;
-  height: fit-content;
-  width: 50px;
+  height: fit-content !important;
+  width: max-content !important;
 }
 
 .reply-btn {
@@ -709,6 +740,26 @@ audio {
 
 .btn:hover {
   opacity: 0.75;
+}
+
+.fadeout-top-msgs {
+  position: absolute;
+  /* top: is handled in JS to match the messaging UI's spacing dynamically */
+  left: 0;
+  right: 0;
+  height: 40px;
+  background: linear-gradient(#0a0a0a, rgba(0, 0, 0, 0) 80%);
+  pointer-events: none;
+}
+
+.fadeout-bottom {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 80px;
+  background: linear-gradient(rgba(0, 0, 0, 0), rgba(0, 0, 0, 1) 80%);
+  pointer-events: none;
 }
 
 .corner-float {

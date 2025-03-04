@@ -202,16 +202,12 @@ emojiSearch.onkeydown = async (e) => {
                 // Add a 'decoy' reaction for good UX (no waiting for the network to register the reaction)
                 const spanReaction = document.createElement('span');
                 spanReaction.classList.add('reaction');
-                spanReaction.style.left = `-2px`;
-                spanReaction.style.bottom = `-2px`;
                 spanReaction.textContent = `${cEmoji.emoji} 1`;
 
-                // Remove the Reaction button
-                const divMessage = document.getElementById(cMsg.id);
-
-                // Note: this is basically a shoddy flow to access the `add-reaction` element.
+                // Replace the Reaction button
                 // DOM Tree: msg-(them/me) -> msg-extras -> add-reaction
-                divMessage.lastElementChild.firstElementChild.replaceWith(spanReaction);
+                const divMessage = document.getElementById(cMsg.id);
+                divMessage.querySelector(`.msg-extras span`).replaceWith(spanReaction);
 
                 // Send the Reaction to the network
                 invoke('react', { referenceId: strCurrentReactionReference, npub: strReceiverPubkey, emoji: cEmoji.emoji });
@@ -265,16 +261,12 @@ picker.addEventListener('click', (e) => {
                 // Add a 'decoy' reaction for good UX (no waiting for the network to register the reaction)
                 const spanReaction = document.createElement('span');
                 spanReaction.classList.add('reaction');
-                spanReaction.style.left = `-2px`;
-                spanReaction.style.bottom = `-2px`;
                 spanReaction.textContent = `${cEmoji.emoji} 1`;
 
-                // Remove the Reaction button
+                // Replace the Reaction button
+                // DOM Tree: msg-(them/me) -> msg-extras -> add-reaction
                 const divMessage = document.getElementById(cMsg.id);
-                divMessage.lastElementChild.remove();
-
-                // Append the Decoy Reaction
-                divMessage.appendChild(spanReaction);
+                divMessage.querySelector(`.msg-extras span`).replaceWith(spanReaction);
 
                 // Send the Reaction to the network
                 invoke('react', { referenceId: strCurrentReactionReference, npub: strReceiverPubkey, emoji: cEmoji.emoji });
@@ -399,6 +391,9 @@ function renderChatlist() {
         }
     }
 
+    // Give the final element a bottom-margin boost to allow scrolling past the fadeout
+    fragment.lastElementChild.style.marginBottom = `50px`;
+
     // Add all elements at once for performance
     if (orderChanged) {
         // Nuke the existing list
@@ -407,6 +402,11 @@ function renderChatlist() {
         }
         // Append our new fragment
         domChatList.appendChild(fragment);
+
+        // Add a fade-in
+        const divFade = document.createElement('div');
+        divFade.classList.add(`fadeout-bottom`);
+        domChatList.appendChild(divFade);
     }
 }
 
@@ -895,6 +895,15 @@ async function updateChat(profile, arrMessages = [], fClicked = false) {
 
         if (!arrMessages.length) return;
 
+        // If it doesn't already exist: add the fadeout to the top of the message list
+        if (!document.getElementById('msg-top-fade')) {
+            const divFade = document.createElement('div');
+            divFade.id = `msg-top-fade`;
+            divFade.classList.add(`fadeout-top-msgs`);
+            divFade.style.top = domChatMessages.offsetTop + 'px';
+            domChatMessages.appendChild(divFade);
+        }
+
         // Efficiently append or prepend messages based on their time relative to the chat
         let cLastMsg = arrMessages.length > 1 ? arrMessages[0] : profile.messages.find(m => m.id === domChatMessages?.lastElementChild?.id);
         let nLastMsgTime = cLastMsg?.at || Date.now() / 1000;
@@ -962,18 +971,55 @@ function renderMessage(msg, sender) {
     // Construct the message container (the DOM ID is the HEX Nostr Event ID)
     const divMessage = document.createElement('div');
     divMessage.id = msg.id;
+
+    // Add a subset of the sender's ID so we have context of WHO sent it, even in group contexts
+    const strShortSenderID = (msg.mine ? strPubkey : sender.id).substring(0, 8);
+    divMessage.setAttribute('sender', strShortSenderID);
+
     // Render it appropriately depending on who sent it
     divMessage.classList.add('msg-' + (msg.mine ? 'me' : 'them'));
-    // Render their avatar, if they have one
-    if (!msg.mine && sender?.avatar) {
-        const imgAvatar = document.createElement('img');
-        imgAvatar.classList.add('avatar');
-        imgAvatar.src = sender.avatar;
-        divMessage.appendChild(imgAvatar);
-    }
 
     // Prepare the message container
     const pMessage = document.createElement('p');
+
+    // Prepare our message container - including avatars and contextual bubble rendering
+    const domMsg = domChatMessages.lastElementChild;
+    if (!domMsg || domMsg.getAttribute('sender') != strShortSenderID) {
+        // Add an avatar if this is not OUR message
+        if (!msg.mine && sender?.avatar) {
+            const imgAvatar = document.createElement('img');
+            imgAvatar.classList.add('avatar');
+            imgAvatar.src = sender.avatar;
+            divMessage.appendChild(imgAvatar);
+        }
+
+        // If there is a message before them, and it isn't theirs, apply additional edits
+        if (domMsg) {
+            // Curve their bottom-left border to encapsulate their message
+            const pMsg = domMsg.querySelector('p');
+            if (pMsg) {
+                pMsg.style.borderBottomLeftRadius = `15px`;
+            }
+
+            // Add some additional margin to separate the senders visually
+            divMessage.style.marginTop = `15px`;
+        }
+    } else {
+        // Add additional margin to simulate avatar space
+        if (!msg.mine && sender?.avatar) {
+            pMessage.style.marginLeft = `60px`;
+        }
+
+        // Flatten the top border to act as a visual continuation
+        const pMsg = domMsg.querySelector('p');
+        if (pMsg) {
+            if (msg.mine) {
+                pMessage.style.borderTopRightRadius = `0`;
+            } else {
+                pMessage.style.borderTopLeftRadius = `0`;
+            }
+        }
+    }
 
     // If we're replying to this, give it a glowing border
     const fReplying = strCurrentReplyReference === msg.id;
@@ -1019,8 +1065,9 @@ function renderMessage(msg, sender) {
     // Render the text - if it's emoji-only and/or file-only, and less than four emojis, format them nicely
     const spanMessage = document.createElement('span');
     if (fEmojiOnly) {
-        // Strip out unnecessary whitespace
-        spanMessage.textContent = strEmojiCleaned;
+        // Preserve linebreaks for creative emoji rendering (tophats on wolves)
+        spanMessage.textContent = msg.content;
+        spanMessage.style.whiteSpace = `pre-wrap`;
         // Add an emoji-only CSS format
         pMessage.classList.add('emoji-only');
         spanMessage.classList.add('emoji-only-content');
@@ -1168,14 +1215,15 @@ function renderMessage(msg, sender) {
     } else if (!msg.mine) {
         // No reaction on the contact's message, so let's display the 'Add Reaction' UI
         spanReaction = document.createElement('span');
-        spanReaction.textContent = `☻`;
-        spanReaction.classList.add('add-reaction', 'hideable');
+        spanReaction.classList.add('add-reaction', 'hideable', 'icon', 'icon-smile-face');
     }
 
     // Construct our "extras" (reactions, reply button, etc)
     // TODO: placeholder style, looks awful, but works!
     const divExtras = document.createElement('div');
     divExtras.classList.add('msg-extras');
+    if (msg.mine) divExtras.style.marginRight = `5px`;
+    else divExtras.style.marginLeft = `5px`;
 
     // These can ONLY be shown on fully sent messages (inherently does not apply to received msgs)
     if (!msg.pending && !msg.failed) {
@@ -1184,10 +1232,6 @@ function renderMessage(msg, sender) {
             if (msg.mine) {
                 // My message: reactions on the left
                 spanReaction.style.left = '5px';
-            } else {
-                // Their message: reactions on the right
-                spanReaction.style.left = '-2px';
-                spanReaction.style.bottom = '-2px';
             }
             divExtras.append(spanReaction);
         } else {
@@ -1198,8 +1242,7 @@ function renderMessage(msg, sender) {
         // Reply Icon (if we're not already replying!)
         if (!fReplying) {
             const spanReply = document.createElement('span');
-            spanReply.classList.add('reply-btn', 'hideable');
-            spanReply.textContent = `R`;
+            spanReply.classList.add('reply-btn', 'hideable', 'icon', 'icon-reply');
             divExtras.append(spanReply);
         }
     }
@@ -1594,6 +1637,14 @@ function adjustSize() {
     // Chat Box: resize the chat to fill the remaining space after the upper Contact area (name)
     const rectContact = domChatContact.getBoundingClientRect();
     domChat.style.height = (window.innerHeight - rectContact.height) + `px`;
+
+    // If the chat is open, and the fade-out exists, then position it correctly
+    if (strOpenChat) {
+        const divFade = document.getElementById('msg-top-fade');
+        if (divFade) {
+            divFade.style.top = domChatMessages.offsetTop + 'px';
+        }
+    }
 
     // If the chat is open, and they've not significantly scrolled up: auto-scroll down to correct against container resizes
     softChatScroll();
