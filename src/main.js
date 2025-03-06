@@ -3,7 +3,7 @@ const { getVersion } = window.__TAURI__.app;
 const { getCurrentWebview } = window.__TAURI__.webview;
 const { listen } = window.__TAURI__.event;
 const { readImage } = window.__TAURI__.clipboardManager;
-const { openUrl } = window.__TAURI__.opener;
+const { openUrl, revealItemInDir } = window.__TAURI__.opener;
 
 // Display the current version
 getVersion().then(v => {
@@ -31,6 +31,7 @@ const domChat = document.getElementById('chat');
 const domChatBackBtn = document.getElementById('chat-back-btn');
 const domChatContact = document.getElementById('chat-contact');
 const domChatContactStatus = document.getElementById('chat-contact-status');
+const domChatMessagesFade = document.getElementById('msg-top-fade');
 const domChatMessages = document.getElementById('chat-messages');
 const domChatMessageBox = document.getElementById('chat-box');
 const domChatMessagesScrollReturnBtn = document.getElementById('chat-scroll-return');
@@ -392,7 +393,7 @@ function renderChatlist() {
     }
 
     // Give the final element a bottom-margin boost to allow scrolling past the fadeout
-    fragment.lastElementChild.style.marginBottom = `50px`;
+    if (fragment.lastElementChild) fragment.lastElementChild.style.marginBottom = `50px`;
 
     // Add all elements at once for performance
     if (orderChanged) {
@@ -539,6 +540,78 @@ async function setupRustListeners() {
         if (!strOpenChat) adjustSize();
     });
 
+    // Listen for Attachment Download Progress events
+    await listen('attachment_download_progress', async (evt) => {
+        // Update the in-memory attachment
+        if (strOpenChat) {
+            let divDownload = document.getElementById(evt.payload.id);
+            if (divDownload) {
+                let divBar = divDownload.querySelector('.progress-bar');
+                if (divBar) {
+                    // Update the Title
+                    const iDownloading = divDownload.querySelector('i');
+                    iDownloading.textContent = `Downloading (${evt.payload.progress}%)`;
+
+                    // Update the Download Progress bar
+                    divBar.style.width = `${evt.payload.progress}%`;
+                } else {
+                    // Create the Download Progress container
+                    let newDivDownload = document.createElement('div');
+                    newDivDownload.id = evt.payload.id;
+                    newDivDownload.style.minWidth = `200px`;
+                    newDivDownload.style.textAlign = `center`;
+
+                    // Create the Download Progress title
+                    const iDownloading = document.createElement('i');
+                    iDownloading.textContent = `Downloading (0%)`;
+                    newDivDownload.appendChild(iDownloading);
+
+                    // Create the Download Progress bar
+                    divBar = document.createElement('div');
+                    divBar.classList.add('progress-bar');
+                    divBar.style.width = `0%`;
+                    newDivDownload.appendChild(divBar);
+
+                    // Replace the previous UI
+                    divDownload.replaceWith(newDivDownload);
+                }
+            }
+        }
+    });
+
+    // Listen for Attachment Download Results
+    await listen('attachment_download_result', async (evt) => {
+        // Update the in-memory attachment
+        let cProfile = arrChats.find(p => p.id === evt.payload.profile_id);
+        let cMsg = cProfile.messages.find(m => m.id === evt.payload.msg_id);
+        let cAttachment = cMsg.attachments.find(a => a.id === evt.payload.id);
+
+        cAttachment.downloading = false;
+        if (evt.payload.success) {
+            cAttachment.downloaded = true;
+
+            // If this user has an open chat, then update the rendered message
+            if (strOpenChat === evt.payload.profile_id) {
+                const domMsg = document.getElementById(evt.payload.msg_id);
+                domMsg?.replaceWith(renderMessage(cMsg, cProfile, evt.payload.msg_id));
+
+                // Scroll accordingly
+                softChatScroll();
+            }
+        } else {
+            // Display the reason the download failed and allow restarting it
+            const divDownload = document.getElementById(evt.payload.id);
+            const iFailed = document.createElement('i');
+            iFailed.id = evt.payload.id;
+            iFailed.toggleAttribute('download', true);
+            iFailed.setAttribute('npub', evt.payload.profile_id);
+            iFailed.setAttribute('msg', evt.payload.msg_id);
+            iFailed.classList.add('btn');
+            iFailed.textContent = `Retry Download (${evt.payload.result})`;
+            divDownload.replaceWith(iFailed);
+        }
+    });
+
     // Listen for profile updates
     await listen('profile_update', (evt) => {
         // Check if the frontend is already aware
@@ -568,35 +641,95 @@ async function setupRustListeners() {
 
     // Listen for incoming messages
     await listen('message_new', (evt) => {
-        // Grab our profile index (a profile should be guarenteed before it's first message event)
+        // Grab our profile index (a profile should be guaranteed before its first message event)
         const nProfileIdx = arrChats.findIndex(p => p.id === evt.payload.chat_id);
+
+        // Get the new message
+        const newMessage = evt.payload.message;
 
         // Double-check we haven't received this twice (unless this is their first message)
         const cFirstMsg = arrChats[nProfileIdx].messages[0];
-        if (arrChats[nProfileIdx].messages.length === 1 && cFirstMsg.id === evt.payload.message.id && !cFirstMsg.mine) return;
+        if (arrChats[nProfileIdx].messages.length === 1 && cFirstMsg.id === newMessage.id && !cFirstMsg.mine) return;
 
         // Reset their typing status
         arrChats[nProfileIdx].typing_until = 0;
 
-        // Append new messages and prepend older messages
-        if (cFirstMsg.at < evt.payload.message.at) {
-            // New message
-            arrChats[nProfileIdx].messages.push(evt.payload.message);
-            // Move the chat to the top of our chatlist
+        // Find the correct position to insert the message based on timestamp
+        const messages = arrChats[nProfileIdx].messages;
+
+        // Check if the array is empty or the new message is newer than the newest message
+        if (messages.length === 0 || newMessage.at > messages[messages.length - 1].at) {
+            // Insert at the end (newest)
+            messages.push(newMessage);
+
+            // Only move the chat to the top if this message is newer than all other chats' latest messages
             if (nProfileIdx > 0) {
-                // Remove the profile at index and get it
-                const [profile] = arrChats.splice(nProfileIdx, 1);
-                // Add it to the beginning
-                arrChats.unshift(profile);
+                let shouldMoveToTop = true;
+
+                // Compare with all other chats' latest messages
+                for (let i = 0; i < nProfileIdx; i++) {
+                    const otherChat = arrChats[i];
+                    if (otherChat.messages && otherChat.messages.length > 0) {
+                        const otherLatestMsg = otherChat.messages[otherChat.messages.length - 1];
+
+                        // If any other chat has a newer message, don't move this one to top
+                        if (otherLatestMsg.at > newMessage.at) {
+                            shouldMoveToTop = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (shouldMoveToTop) {
+                    // Remove the profile at index and get it
+                    const [profile] = arrChats.splice(nProfileIdx, 1);
+                    // Add it to the beginning
+                    arrChats.unshift(profile);
+                } else {
+                    // Find the correct position to place this chat based on message time
+                    let insertIdx = 0;
+                    while (insertIdx < nProfileIdx &&
+                        arrChats[insertIdx].messages.length > 0 &&
+                        arrChats[insertIdx].messages[arrChats[insertIdx].messages.length - 1].at > newMessage.at) {
+                        insertIdx++;
+                    }
+
+                    if (insertIdx < nProfileIdx) {
+                        // Remove the profile and insert it at the correct position
+                        const [profile] = arrChats.splice(nProfileIdx, 1);
+                        arrChats.splice(insertIdx, 0, profile);
+                    }
+                }
             }
-        } else {
-            // Old message
-            arrChats[nProfileIdx].messages.unshift(evt.payload.message);
+        }
+        // Check if the new message is older than the oldest message
+        else if (newMessage.at < messages[0].at) {
+            // Insert at the beginning (oldest)
+            messages.unshift(newMessage);
+        }
+        // Otherwise, find the correct position in the middle
+        else {
+            // Binary search for better performance with large message arrays
+            let low = 0;
+            let high = messages.length - 1;
+
+            while (low <= high) {
+                const mid = Math.floor((low + high) / 2);
+
+                if (messages[mid].at < newMessage.at) {
+                    low = mid + 1;
+                } else {
+                    high = mid - 1;
+                }
+            }
+
+            // Insert the message at the correct position (low is now the index where it should go)
+            messages.splice(low, 0, newMessage);
         }
 
-        // If this user has an open chat, then soft-update the chat too
+        // If this user has the open chat, then update the chat too
         if (strOpenChat === evt.payload.chat_id) {
-            updateChat(arrChats[0], [evt.payload.message]);
+            updateChat(arrChats.find(p => p.id === evt.payload.chat_id), [newMessage]);
         }
 
         // Render the Chat List
@@ -616,7 +749,7 @@ async function setupRustListeners() {
         if (strOpenChat === evt.payload.chat_id) {
             // TODO: is there a slight possibility of a race condition here? i.e: `message_update` calls before `message_new` and thus domMsg isn't found?
             const domMsg = document.getElementById(evt.payload.old_id);
-            domMsg?.replaceWith(renderMessage(evt.payload.message, cProfile));
+            domMsg?.replaceWith(renderMessage(evt.payload.message, cProfile, evt.payload.old_id));
 
             // If the old ID was a pending ID (our message), make sure to update and scroll accordingly
             if (evt.payload.old_id.startsWith('pending')) {
@@ -876,7 +1009,7 @@ let strCurrentReplyReference = "";
 /**
  * Updates the current chat (to display incoming and outgoing messages)
  * @param {Profile} profile 
- * @param {Array<Message>} arrMessages - The messages to efficiently append/prepend to the chat
+ * @param {Array<Message>} arrMessages - The messages to efficiently insert into the chat
  * @param {boolean} fClicked - Whether the chat was opened manually or not
  */
 async function updateChat(profile, arrMessages = [], fClicked = false) {
@@ -895,46 +1028,119 @@ async function updateChat(profile, arrMessages = [], fClicked = false) {
 
         if (!arrMessages.length) return;
 
-        // If it doesn't already exist: add the fadeout to the top of the message list
-        if (!document.getElementById('msg-top-fade')) {
-            const divFade = document.createElement('div');
-            divFade.id = `msg-top-fade`;
-            divFade.classList.add(`fadeout-top-msgs`);
-            divFade.style.top = domChatMessages.offsetTop + 'px';
-            domChatMessages.appendChild(divFade);
-        }
+        // Track last message time for timestamp insertion
+        let nLastMsgTime = null;
 
-        // Efficiently append or prepend messages based on their time relative to the chat
-        let cLastMsg = arrMessages.length > 1 ? arrMessages[0] : profile.messages.find(m => m.id === domChatMessages?.lastElementChild?.id);
-        let nLastMsgTime = cLastMsg?.at || Date.now() / 1000;
+        // Process each message for insertion
         for (const msg of arrMessages) {
-            // If the last message was over 10 minutes ago, add an inline timestamp
-            if (msg.at - nLastMsgTime > 600) {
-                nLastMsgTime = msg.at;
-                const pTimestamp = document.createElement('p');
-                pTimestamp.classList.add('msg-inline-timestamp');
-                const messageDate = new Date(msg.at * 1000);
-
-                // Render the time contextually
-                if (isToday(messageDate)) {
-                    pTimestamp.textContent = messageDate.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true });
-                } else if (isYesterday(messageDate)) {
-                    pTimestamp.textContent = `Yesterday, ${messageDate.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true })}`;
-                } else {
-                    pTimestamp.textContent = messageDate.toLocaleString();
-                }
-                domChatMessages.appendChild(pTimestamp);
+            // Quick check for empty chat - simple append
+            if (domChatMessages.children.length === 0) {
+                domChatMessages.appendChild(renderMessage(msg, profile));
+                continue;
             }
 
-            const domMsg = renderMessage(msg, profile);
-            if (!cLastMsg || cLastMsg.at < msg.at) {
-                // If the message is newer than the last, append it
-                // Note: if it's an incoming single new message, then we animate it too
-                if (!msg.mine && arrMessages.length === 1) domMsg.classList.add('new-anim');
+            // Direct comparison with newest and oldest messages (most common cases)
+            // This avoids expensive DOM operations for the common cases
+
+            // Get the newest message in the DOM
+            const newestMsgElement = domChatMessages.lastElementChild;
+            const newestMsg = profile.messages.find(m => m.id === newestMsgElement.id);
+            if (newestMsg && msg.at > newestMsg.at) {
+                // It's the newest message, append it
+
+                // Add timestamp if needed
+                if (nLastMsgTime === null) {
+                    nLastMsgTime = newestMsg.at;
+                }
+
+                if (msg.at - nLastMsgTime > 600) {
+                    insertTimestamp(msg.at, domChatMessages);
+                    nLastMsgTime = msg.at;
+                }
+
+                // Render message post-time-insert for improved message rendering context
+                const domMsg = renderMessage(msg, profile);
+                if (!msg.mine && arrMessages.length === 1) {
+                    domMsg.classList.add('new-anim');
+                }
+
                 domChatMessages.appendChild(domMsg);
-            } else {
-                // Otherwise, these are older messages, prepend them
-                domChatMessages.prepend(domMsg);
+                continue;
+            }
+
+            // If we're prepending, ensure there's no more than 50 existing messages at max
+            if (domChatMessages.childElementCount >= 50) break;
+
+            // Get the oldest message in the DOM
+            let oldestMsgElement = null;
+            for (let i = 0; i < domChatMessages.children.length; i++) {
+                const child = domChatMessages.children[i];
+                if (child.getAttribute('sender')) {
+                    oldestMsgElement = child;
+                    break;
+                }
+            }
+
+            if (oldestMsgElement) {
+                const oldestMsg = profile.messages.find(m => m.id === oldestMsgElement.id);
+                if (oldestMsg && msg.at < oldestMsg.at) {
+                    // It's the oldest message, prepend it
+                    const domMsg = renderMessage(msg, profile);
+                    domChatMessages.insertBefore(domMsg, oldestMsgElement);
+                    continue;
+                }
+            }
+
+            // If we get here, the message belongs somewhere in the middle
+            // This is a less common case, so we'll do a linear scan
+            let inserted = false;
+
+            // Get the message elements sorted by time (oldest to newest)
+            // We'll do a linear scan since we expect this to be rare and the chat isn't likely huge
+            let messageNodes = [];
+            for (let i = 0; i < domChatMessages.children.length; i++) {
+                const child = domChatMessages.children[i];
+                if (child.id && child.getAttribute('sender')) {
+                    const childMsg = profile.messages.find(m => m.id === child.id);
+                    if (childMsg) {
+                        messageNodes.push({ element: child, message: childMsg });
+                    }
+                }
+            }
+
+            // Sort by timestamp if needed (they might not be in order in the DOM)
+            messageNodes.sort((a, b) => a.message.at - b.message.at);
+
+            // Find the correct position to insert
+            for (let i = 0; i < messageNodes.length - 1; i++) {
+                const currentNode = messageNodes[i];
+                const nextNode = messageNodes[i + 1];
+
+                if (currentNode.message.at <= msg.at && msg.at <= nextNode.message.at) {
+                    // Add timestamp if needed
+                    if (msg.at - currentNode.message.at > 600) {
+                        const timestamp = insertTimestamp(msg.at);
+                        domChatMessages.insertBefore(timestamp, nextNode.element);
+                    }
+
+                    // Insert between these two messages
+                    const domMsg = renderMessage(msg, profile);
+                    domChatMessages.insertBefore(domMsg, nextNode.element);
+                    inserted = true;
+                    break;
+                }
+            }
+
+            // If somehow not inserted by the above logic, append as fallback
+            if (!inserted) {
+                // Check if we need a timestamp
+                const lastMsg = messageNodes[messageNodes.length - 1]?.message;
+                if (lastMsg && msg.at - lastMsg.at > 600) {
+                    insertTimestamp(msg.at, domChatMessages);
+                }
+
+                const domMsg = renderMessage(msg, profile);
+                domChatMessages.appendChild(domMsg);
             }
         }
 
@@ -963,11 +1169,39 @@ async function updateChat(profile, arrMessages = [], fClicked = false) {
 }
 
 /**
+ * Helper function to create and insert a timestamp
+ * @param {number} timestamp - Unix timestamp in seconds
+ * @param {HTMLElement} parent - Optional parent to append to
+ * @returns {HTMLElement} - The created timestamp element
+ */
+function insertTimestamp(timestamp, parent = null) {
+    const pTimestamp = document.createElement('p');
+    pTimestamp.classList.add('msg-inline-timestamp');
+    const messageDate = new Date(timestamp * 1000);
+
+    // Render the time contextually
+    if (isToday(messageDate)) {
+        pTimestamp.textContent = messageDate.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true });
+    } else if (isYesterday(messageDate)) {
+        pTimestamp.textContent = `Yesterday, ${messageDate.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true })}`;
+    } else {
+        pTimestamp.textContent = messageDate.toLocaleString();
+    }
+
+    if (parent) {
+        parent.appendChild(pTimestamp);
+    }
+
+    return pTimestamp;
+}
+
+/**
  * Convert a Message in to a rendered HTML Element
  * @param {Message} msg - the Message to be converted
  * @param {Profile} sender - the Profile of the message sender
+ * @param {string?} editID - the ID of the message being edited, used for improved renderer context
  */
-function renderMessage(msg, sender) {
+function renderMessage(msg, sender, editID = '') {
     // Construct the message container (the DOM ID is the HEX Nostr Event ID)
     const divMessage = document.createElement('div');
     divMessage.id = msg.id;
@@ -983,8 +1217,9 @@ function renderMessage(msg, sender) {
     const pMessage = document.createElement('p');
 
     // Prepare our message container - including avatars and contextual bubble rendering
-    const domMsg = domChatMessages.lastElementChild;
-    if (!domMsg || domMsg.getAttribute('sender') != strShortSenderID) {
+    const domPrevMsg = editID ? document.getElementById(editID).previousElementSibling : domChatMessages.lastElementChild;
+    const fIsMsg = !!domPrevMsg?.getAttribute('sender');
+    if (!domPrevMsg || domPrevMsg.getAttribute('sender') != strShortSenderID) {
         // Add an avatar if this is not OUR message
         if (!msg.mine && sender?.avatar) {
             const imgAvatar = document.createElement('img');
@@ -994,9 +1229,9 @@ function renderMessage(msg, sender) {
         }
 
         // If there is a message before them, and it isn't theirs, apply additional edits
-        if (domMsg) {
+        if (domPrevMsg && fIsMsg) {
             // Curve their bottom-left border to encapsulate their message
-            const pMsg = domMsg.querySelector('p');
+            const pMsg = domPrevMsg.querySelector('p');
             if (pMsg) {
                 pMsg.style.borderBottomLeftRadius = `15px`;
             }
@@ -1011,7 +1246,7 @@ function renderMessage(msg, sender) {
         }
 
         // Flatten the top border to act as a visual continuation
-        const pMsg = domMsg.querySelector('p');
+        const pMsg = domPrevMsg.querySelector('p');
         if (pMsg) {
             if (msg.mine) {
                 pMessage.style.borderTopRightRadius = `0`;
@@ -1083,6 +1318,7 @@ function renderMessage(msg, sender) {
     pMessage.appendChild(spanMessage);
 
     // Append attachments
+    let strRevealAttachmentPath = '';
     if (msg.attachments.length) {
         // Float the content depending on who's it is
         pMessage.style.float = msg.mine ? 'right' : 'left';
@@ -1091,6 +1327,9 @@ function renderMessage(msg, sender) {
     }
     for (const cAttachment of msg.attachments) {
         if (cAttachment.downloaded) {
+            // Save the path for our File Explorer shortcut
+            strRevealAttachmentPath = cAttachment.path;
+
             // Convert the absolute file path to a Tauri asset
             const assetUrl = convertFileSrc(cAttachment.path);
 
@@ -1143,8 +1382,31 @@ function renderMessage(msg, sender) {
                 iUnknown.textContent = `Previews not supported for "${cAttachment.extension}" files yet`;
                 pMessage.appendChild(iUnknown);
             }
+        } else if (cAttachment.downloading) {
+            // Display download progression UI
+            const iDownloading = document.createElement('i');
+            iDownloading.id = cAttachment.id;
+            iDownloading.textContent = `Downloading`;
+            pMessage.appendChild(iDownloading);
         } else {
+            // Determine and display file size
+            let strSize = 'Unknown Size';
+            if (cAttachment.size > 0) strSize = formatBytes(cAttachment.size);
+
             // Display download prompt UI
+            const iDownload = document.createElement('i');
+            iDownload.id = cAttachment.id;
+            iDownload.toggleAttribute('download', true);
+            iDownload.setAttribute('npub', sender.id);
+            iDownload.setAttribute('msg', msg.id);
+            iDownload.classList.add('btn');
+            iDownload.textContent = `Download ${cAttachment.extension.toUpperCase()} (${strSize})`;
+            pMessage.appendChild(iDownload);
+
+            // If the size is known and within auto-download range; immediately begin downloading
+            if (cAttachment.size > 0 && cAttachment.size <= MAX_AUTO_DOWNLOAD_BYTES) {
+                invoke('download_attachment', { npub: sender.id, msgId: msg.id, attachmentId: cAttachment.id });
+            }
         }
     }
 
@@ -1244,6 +1506,14 @@ function renderMessage(msg, sender) {
             const spanReply = document.createElement('span');
             spanReply.classList.add('reply-btn', 'hideable', 'icon', 'icon-reply');
             divExtras.append(spanReply);
+        }
+
+        // File Reveal Icon (if a file was attached)
+        if (strRevealAttachmentPath) {
+            const spanReveal = document.createElement('span');
+            spanReveal.setAttribute('filepath', strRevealAttachmentPath);
+            spanReveal.classList.add('hideable', 'icon', 'icon-file-search');
+            divExtras.append(spanReveal);
         }
     }
 
@@ -1590,6 +1860,11 @@ document.addEventListener('click', (e) => {
     // If we're clicking a Reply button, begin a reply
     if (e.target.classList.contains("reply-btn")) return selectReplyingMessage(e);
 
+    // If we're clicking a File Reveal button, reveal the file with the OS File Explorer
+    if (e.target.getAttribute('filepath')) {
+        return revealItemInDir(e.target.getAttribute('filepath'));
+    }
+
     // If we're clicking a Reply context, center the referenced message in view
     if (e.target.classList.contains('msg-reply') || e.target.parentElement?.classList.contains('msg-reply')) {
         // Note: The `substring(2)` removes the `r-` prefix
@@ -1617,6 +1892,11 @@ document.addEventListener('click', (e) => {
     // If we're clicking a Contact, open the chat with the embedded npub (ID)
     if (e.target.classList.contains("chatlist-contact")) return openChat(e.target.id);
 
+    // If we're clicking an Attachment Download button, request the download
+    if (e.target.hasAttribute('download')) {
+        return invoke('download_attachment', { npub: e.target.getAttribute('npub'), msgId: e.target.getAttribute('msg'), attachmentId: e.target.id });
+    }
+
     // Run the emoji panel open/close logic
     openEmojiPanel(e);
 });
@@ -1640,10 +1920,7 @@ function adjustSize() {
 
     // If the chat is open, and the fade-out exists, then position it correctly
     if (strOpenChat) {
-        const divFade = document.getElementById('msg-top-fade');
-        if (divFade) {
-            divFade.style.top = domChatMessages.offsetTop + 'px';
-        }
+        domChatMessagesFade.style.top = domChatMessages.offsetTop + 'px';
     }
 
     // If the chat is open, and they've not significantly scrolled up: auto-scroll down to correct against container resizes
