@@ -2,7 +2,6 @@ const { invoke, convertFileSrc } = window.__TAURI__.core;
 const { getVersion } = window.__TAURI__.app;
 const { getCurrentWebview } = window.__TAURI__.webview;
 const { listen } = window.__TAURI__.event;
-const { readImage } = window.__TAURI__.clipboardManager;
 const { openUrl, revealItemInDir } = window.__TAURI__.opener;
 
 // Display the current version
@@ -448,7 +447,7 @@ function renderContact(chat) {
         pChatPreview.textContent = `Typing...`;
     } else if (!cLastMsg.content) {
         // Not typing, and no text; display as an attachment
-        pChatPreview.textContent = (cLastMsg.mine ? 'You: ' : '') + 'Sent an attachment';
+        pChatPreview.textContent = (cLastMsg.mine ? 'You: ' : '') + 'Sent a ' + getFileTypeInfo(cLastMsg.attachments[0].extension).description;
     } else {
         // Not typing; display their last message
         pChatPreview.textContent = (cLastMsg.mine ? 'You: ' : '') + cLastMsg.content;
@@ -740,7 +739,9 @@ async function setupRustListeners() {
     await listen('message_update', (evt) => {
         // Find the message we're updating
         const cProfile = arrChats.find(p => p.id === evt.payload.chat_id);
+        if (!cProfile) return;
         const nMsgIdx = cProfile.messages.findIndex(m => m.id === evt.payload.old_id);
+        if (nMsgIdx === -1) return;
 
         // Update it
         cProfile.messages[nMsgIdx] = evt.payload.message;
@@ -1067,6 +1068,10 @@ async function updateChat(profile, arrMessages = [], fClicked = false) {
                 const domMsg = renderMessage(msg, profile);
                 if (!msg.mine && arrMessages.length === 1) {
                     domMsg.classList.add('new-anim');
+                    domMsg.addEventListener('animationend', () => {
+                        // Remove the animation class once it finishes
+                        domMsg?.classList?.remove('new-anim');
+                    }, { once: true });
                 }
 
                 domChatMessages.appendChild(domMsg);
@@ -1280,17 +1285,41 @@ function renderMessage(msg, sender, editID = '') {
             // Name + Message
             const spanName = document.createElement('span');
             spanName.style.color = `rgba(255, 255, 255, 0.7)`;
-            const spanRef = document.createElement('span');
-            spanRef.style.color = `rgba(255, 255, 255, 0.45)`;
 
             // Name
             const cSenderProfile = !cMsg.mine ? sender : arrChats.find(a => a.mine);
             spanName.textContent = cSenderProfile.name ? cSenderProfile.name : cSenderProfile.id.substring(0, 10) + '…';
 
             // Replied-to content (Text or Attachment)
-            if (cMsg.content)
+            let spanRef;
+            if (cMsg.content) {
+                spanRef = document.createElement('span');
+                spanRef.style.color = `rgba(255, 255, 255, 0.45)`;
                 spanRef.textContent = cMsg.content.length < 50 ? cMsg.content : cMsg.content.substring(0, 50) + '…';
-            else if (cMsg.attachments.length) spanRef.textContent = `Attachment`;
+            } else if (cMsg.attachments.length) {
+                // For Attachments, we display an additional icon for quickly inferring the replied-to content
+                spanRef = document.createElement('div');
+                spanRef.style.display = `flex`;
+                const cFileType = getFileTypeInfo(cMsg.attachments[0].extension);
+
+                // Icon
+                const spanIcon = document.createElement('span');
+                spanIcon.classList.add('icon', 'icon-' + cFileType.icon);
+                spanIcon.style.position = `relative`;
+                spanIcon.style.backgroundColor = `rgba(255, 255, 255, 0.45)`;
+                spanIcon.style.width = `18px`;
+                spanIcon.style.height = `18px`;
+                spanIcon.style.margin = `0px`;
+
+                // Description
+                const spanDesc = document.createElement('span');
+                spanDesc.style.color = `rgba(255, 255, 255, 0.45)`;
+                spanDesc.style.marginLeft = `5px`;
+                spanDesc.textContent = cFileType.description;
+
+                // Combine
+                spanRef.append(spanIcon, spanDesc);
+            }
 
             divRef.appendChild(spanName);
             divRef.appendChild(document.createElement('br'));
@@ -1562,7 +1591,8 @@ function cancelReply() {
 
     // Cancel any existing reply-focus
     if (strCurrentReplyReference) {
-        document.getElementById(strCurrentReplyReference).querySelector('p').style.borderColor = ``;
+        let domMsg = document.getElementById(strCurrentReplyReference);
+        if (domMsg) domMsg.querySelector('p').style.borderColor = ``;
     }
 
     // Remove the reply ID
@@ -1737,36 +1767,26 @@ window.addEventListener("DOMContentLoaded", async () => {
     // Hook up an in-chat File Paste listener
     document.onpaste = async (evt) => {
         if (strOpenChat) {
-            for (const item of evt.clipboardData.items) {
-                // Check if the pasted content is an image
-                if (item.type.startsWith('image/')) {
-                    const blob = await readImage();
-                    if (blob) {
-                        // Placeholder
-                        domChatMessageInput.value = '';
-                        domChatMessageInput.setAttribute('placeholder', 'Sending...');
+            // Check if the clipboard data contains an image
+            if (Array.from(evt.clipboardData.items).some(item => item.type.startsWith('image/'))) {
+                evt.preventDefault();
 
-                        // Convert Tauri Clipboard blob to image components
-                        const rgba = await blob.rgba();
-                        const size = await blob.size();
+                // Placeholder
+                domChatMessageInput.value = '';
+                domChatMessageInput.setAttribute('placeholder', 'Sending...');
 
-                        // Send raw bytes to Rust
-                        await invoke('paste_message', {
-                            receiver: strOpenChat,
-                            repliedTo: strCurrentReplyReference,
-                            pixels: rgba,
-                            width: size.width,
-                            height: size.height
-                        });
+                // Tell the Rust backend to acquire the image from clipboard and send it to the current chat
+                await invoke('paste_message', {
+                    receiver: strOpenChat,
+                    repliedTo: strCurrentReplyReference
+                });
 
-                        // Reset placeholder
-                        cancelReply();
-                        nLastTypingIndicator = 0;
-                    }
-                }
+                // Reset placeholder
+                cancelReply();
+                nLastTypingIndicator = 0;
             }
         }
-    }
+    };
 
     // Hook up an 'Enter' listener on the Message Box for sending messages
     domChatMessageInput.onkeydown = async (evt) => {
@@ -1842,6 +1862,13 @@ window.addEventListener("DOMContentLoaded", async () => {
                     cancelReply();
                     nLastTypingIndicator = 0;
                 }
+
+                /*
+                const blob = new Blob([wavData], { type: 'audio/wav' });
+                const url = URL.createObjectURL(blob);
+                const audio = new Audio(url);
+                audio.play();
+                */
             }
         } else {
             // Display our recording status
@@ -1868,9 +1895,9 @@ document.addEventListener('click', (e) => {
     }
 
     // If we're clicking a Reply context, center the referenced message in view
-    if (e.target.classList.contains('msg-reply') || e.target.parentElement?.classList.contains('msg-reply')) {
+    if (e.target.classList.contains('msg-reply') || e.target.parentElement?.classList.contains('msg-reply')  || e.target.parentElement?.parentElement?.classList.contains('msg-reply')) {
         // Note: The `substring(2)` removes the `r-` prefix
-        const strID = e.target.id || e.target.parentElement.id;
+        const strID = e.target.id || e.target.parentElement?.id || e.target.parentElement.parentElement.id;
         const domMsg = document.getElementById(strID.substring(2));
         centerInView(domMsg);
 

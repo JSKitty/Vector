@@ -11,6 +11,7 @@ use chacha20poly1305::{
 };
 use ::image::{ImageEncoder, codecs::png::PngEncoder, ExtendedColorType::Rgba8};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
+use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_fs::FsExt;
 use scraper::{Html, Selector};
@@ -79,6 +80,28 @@ impl Message {
     /// Get an attachment by ID
     fn get_attachment_mut(&mut self, id: &str) -> Option<&mut Attachment> {
         self.attachments.iter_mut().find(|p| p.id == id)
+    }
+
+    /// Add a Reaction - if it was not already added
+    fn add_reaction(&mut self, reaction: Reaction, chat_id: Option<&str>) -> bool {
+        // Make sure we don't add the same reaction twice
+        if !self.reactions.iter().any(|r| r.id == reaction.id) {
+            self.reactions.push(reaction);
+
+            // Update the frontend if a Chat ID was provided
+            if let Some(chat) = chat_id {
+                let handle = TAURI_APP.get().unwrap();
+                handle.emit("message_update", serde_json::json!({
+                    "old_id": &self.id,
+                    "message": &self,
+                    "chat_id": chat
+                })).unwrap();
+            }
+            true
+        } else {
+            // Reaction was already added previously
+            false
+        }
     }
 }
 
@@ -237,32 +260,6 @@ impl Profile {
         }
         true
     }
-
-    /// Add a Reaction to a Message
-    fn internal_add_reaction(&mut self, msg_id: &str, reaction: Reaction) -> bool {
-        // Find the message being reacted to
-        match self.get_message_mut(msg_id) {
-            Some(msg) => {
-                // Make sure we don't add the same reaction twice
-                if !msg.reactions.iter().any(|r| r.id == reaction.id) {
-                    msg.reactions.push(reaction);
-
-                    // Update the frontend
-                    let handle = TAURI_APP.get().unwrap();
-                    handle.emit("message_update", serde_json::json!({
-                        "old_id": &msg.id,
-                        "message": &msg,
-                        "chat_id": &self.id
-                    })).unwrap();
-                    true
-                } else {
-                    // Reaction was already added previously
-                    false
-                }
-            }
-            None => false,
-        }
-    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
@@ -282,17 +279,34 @@ impl Status {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+enum SyncMode {
+    ForwardSync,   // Initial sync from most recent message going backward
+    BackwardSync,  // Syncing historically old messages
+    Finished       // Sync complete
+}
+
 #[derive(serde::Serialize, Clone, Debug)]
 struct ChatState {
     profiles: Vec<Profile>,
-    days_to_sync: u8
+    is_syncing: bool,
+    sync_window_start: u64,  // Start timestamp of current window
+    sync_window_end: u64,    // End timestamp of current window
+    sync_mode: SyncMode,
+    sync_empty_iterations: u8, // Counter for consecutive empty iterations
+    sync_total_iterations: u8, // Counter for total iterations in current mode
 }
 
 impl ChatState {
     fn new() -> Self {
         Self {
             profiles: Vec::new(),
-            days_to_sync: 2
+            is_syncing: false,
+            sync_window_start: 0,
+            sync_window_end: 0,
+            sync_mode: SyncMode::Finished,
+            sync_empty_iterations: 0,
+            sync_total_iterations: 0,
         }
     }
 
@@ -371,16 +385,6 @@ impl ChatState {
 
         is_msg_added
     }
-
-    /// Add a Reaction to a Message in a Vector Profile
-    fn add_reaction(&mut self, npub: &str, msg_id: &str, reaction: Reaction) -> bool {
-        // Get the profile
-        match self.get_profile_mut(npub) {
-            // If the profile is found; add the reaction to the profile's message
-            Some(profile) => profile.internal_add_reaction(msg_id, reaction),
-            None => false,
-        }
-    }
 }
 
 lazy_static! {
@@ -399,54 +403,98 @@ async fn fetch_messages<R: Runtime>(
     let my_public_key = signer.get_public_key().await.unwrap();
 
     // Determine the time range to fetch
-    let days_to_search = STATE.lock().await.days_to_sync as u64;
-    let (since_timestamp, until_timestamp) = if init {
-        // Load our DB (if we haven't already; i.e: our profile is the single loaded profile since login)
+    let (since_timestamp, until_timestamp) = {
         let mut state = STATE.lock().await;
-        if state.profiles.len() == 1 {
-            let profiles = db::get_all_profiles(&handle).await.unwrap();
-            let msgs = db::get_all_messages(&handle).await.unwrap();
+        
+        if init {
+            // Load our DB (if we haven't already; i.e: our profile is the single loaded profile since login)
+            if state.profiles.len() == 1 {
+                let profiles = db::get_all_profiles(&handle).await.unwrap();
+                let msgs = db::get_all_messages(&handle).await.unwrap();
 
-            // Load our Profile Cache in to the state
-            state.merge_db_profiles(profiles).await;
+                // Load our Profile Cache into the state
+                state.merge_db_profiles(profiles).await;
 
-            // Add each message to the state, keeping the earliest known message
-            for (msg, npub) in msgs {
-                state.add_message(&npub, msg);
+                // Add each message to the state
+                for (msg, npub) in msgs {
+                    state.add_message(&npub, msg);
+                }
             }
-        }
 
-        // Send the state to our frontend to signal finalised init with a full state
-        handle.emit("init_finished", &state.profiles).unwrap();
+            // Send the state to our frontend to signal finalised init with a full state
+            handle.emit("init_finished", &state.profiles).unwrap();
 
-        // Now fetch messages from the given period, to fill any "gaps" since the app was last opened
-        (
-            Timestamp::from_secs(Timestamp::now().as_u64() - (60 * 60 * 24 * days_to_search)),
-            Timestamp::now()
-        )
-    } else {
-        // Find the oldest message timestamp from our state
-        match get_oldest_message_timestamp().await {
-            Some(oldest_ts) => {
-                // Fetch the period before our oldest message
-                let since = Timestamp::from_secs(oldest_ts - (60 * 60 * 24 * days_to_search));
-                let until = Timestamp::from_secs(oldest_ts);
-                (since, until)
-            },
-            None => {
-                // No messages in DB yet, do an initial fetch
-                (
-                    Timestamp::from_secs(Timestamp::now().as_u64() - (60 * 60 * 24 * days_to_search)),
-                    Timestamp::now()
-                )
-            }
+            // ALWAYS begin with an initial sync of at least the last 2 days
+            let now = Timestamp::now();
+
+            state.is_syncing = true;
+            state.sync_mode = SyncMode::ForwardSync;
+            state.sync_empty_iterations = 0;
+            state.sync_total_iterations = 0;
+
+            // Initial 2-day window: now - 2 days → now
+            let two_days_ago = now.as_u64() - (60 * 60 * 24 * 2);
+
+            state.sync_window_start = two_days_ago;
+            state.sync_window_end = now.as_u64();
+
+            (
+                Timestamp::from_secs(two_days_ago),
+                now
+            )
+        } else if state.sync_mode == SyncMode::ForwardSync {
+            // Forward sync (filling gaps from last message to now)
+            let window_start = state.sync_window_start;
+
+            // Adjust window for next iteration (go back in time in 2-day increments)
+            let new_window_end = window_start;
+            let new_window_start = window_start - (60 * 60 * 24 * 2); // Always 2 days
+
+            // Update state with new window
+            state.sync_window_start = new_window_start;
+            state.sync_window_end = new_window_end;
+
+            (
+                Timestamp::from_secs(new_window_start),
+                Timestamp::from_secs(new_window_end)
+            )
+        } else if state.sync_mode == SyncMode::BackwardSync {
+            // Backward sync (historically old messages)
+            let window_start = state.sync_window_start;
+
+            // Move window backward in time in 2-day increments
+            let new_window_end = window_start;
+            let new_window_start = window_start - (60 * 60 * 24 * 2); // Always 2 days
+
+            // Update state with new window
+            state.sync_window_start = new_window_start;
+            state.sync_window_end = new_window_end;
+
+            (
+                Timestamp::from_secs(new_window_start),
+                Timestamp::from_secs(new_window_end)
+            )
+        } else {
+            // Sync finished or in unknown state
+            // Return dummy values, won't be used as we'll end sync
+            (Timestamp::now(), Timestamp::now())
         }
     };
+
+    // If sync is finished, emit the finished event and return
+    {
+        let state = STATE.lock().await;
+        if state.sync_mode == SyncMode::Finished {
+            handle.emit("sync_finished", ()).unwrap();
+            return;
+        }
+    }
 
     // Emit our current "Sync Range" to the frontend
     handle.emit("sync_progress", serde_json::json!({
         "since": since_timestamp.as_u64(),
-        "until": until_timestamp.as_u64()
+        "until": until_timestamp.as_u64(),
+        "mode": format!("{:?}", STATE.lock().await.sync_mode)
     })).unwrap();
 
     // Fetch GiftWraps related to us within the time window
@@ -470,23 +518,84 @@ async fn fetch_messages<R: Runtime>(
         }
     }
 
-    // If no messages were retrieved; we bump our search radius until a maximum of 10 days
-    let max_search_range_reached = days_to_search >= 10;
-    if new_messages_count == 0 && !max_search_range_reached {
-        STATE.lock().await.days_to_sync += 2;
-    } else {
-        STATE.lock().await.days_to_sync = 2;
-    }
+    // Process sync results and determine next steps
+    let should_continue = {
+        let mut state = STATE.lock().await;
+        let mut continue_sync = true;
 
-    // Once we've searched a 10-day slice without new messages; we give up and finish sync
-    if max_search_range_reached {
-        handle.emit("sync_finished", serde_json::json!({
-            "since": since_timestamp.as_u64(),
-            "until": until_timestamp.as_u64()
-        })).unwrap();
-    } else {
+        // Increment total iterations counter
+        state.sync_total_iterations += 1;
+
+        // Update state based on if messages were found
+        if new_messages_count > 0 {
+            state.sync_empty_iterations = 0;
+        } else {
+            state.sync_empty_iterations += 1;
+        }
+
+        if state.sync_mode == SyncMode::ForwardSync {
+            // Forward sync transitions to backward sync after:
+            // 1. Finding messages and going 3 more iterations without messages, or
+            // 2. Going 5 iterations without finding any messages
+            let enough_empty_iterations = state.sync_empty_iterations >= 5;
+            let found_then_empty = new_messages_count > 0 && state.sync_empty_iterations >= 3;
+
+            if found_then_empty || enough_empty_iterations {
+                // Release the mutex before performing potentially slow operations
+                drop(state);
+
+                // Start backward sync from the oldest message
+                let oldest_ts_result = get_oldest_message_timestamp().await;
+
+                // Re-acquire mutex after operation
+                let mut state = STATE.lock().await;
+
+                // Time to switch mode regardless of result
+                state.sync_mode = SyncMode::BackwardSync;
+                state.sync_empty_iterations = 0;
+                state.sync_total_iterations = 0;
+
+                if let Some(oldest_ts) = oldest_ts_result {
+                    state.sync_window_end = oldest_ts;
+                    state.sync_window_start = oldest_ts - (60 * 60 * 24 * 2); // 2 days before oldest
+                } else {
+                    // Still start backward sync, but from recent history
+                    let now = Timestamp::now().as_u64();
+                    let thirty_days_ago = now - (60 * 60 * 24 * 30);
+
+                    state.sync_window_end = thirty_days_ago;
+                    state.sync_window_start = thirty_days_ago - (60 * 60 * 24 * 2);
+                }
+            }
+        } else if state.sync_mode == SyncMode::BackwardSync {
+            // For backward sync, continue until:
+            // No messages found for 5 consecutive iterations
+            let enough_empty_iterations = state.sync_empty_iterations >= 5;
+
+            if enough_empty_iterations {
+                // We've completed backward sync
+                state.sync_mode = SyncMode::Finished;
+                continue_sync = false;
+            }
+        } else {
+            continue_sync = false; // Unknown state, stop syncing
+        }
+
+        continue_sync
+    };
+
+    if should_continue {
         // Keep synchronising
         handle.emit("sync_slice_finished", ()).unwrap();
+    } else {
+        // We're done with sync
+        let mut state = STATE.lock().await;
+        state.sync_mode = SyncMode::Finished;
+        state.is_syncing = false;
+        state.sync_empty_iterations = 0;
+        state.sync_total_iterations = 0;
+
+        handle.emit("sync_finished", ()).unwrap();
     }
 }
 
@@ -758,17 +867,20 @@ async fn message(receiver: String, content: String, replied_to: String, file: Op
 }
 
 #[tauri::command]
-async fn paste_message(receiver: String, replied_to: String, pixels: Vec<u8>, width: u32, height: u32) -> Result<bool, String> {
+async fn paste_message<R: Runtime>(handle: AppHandle<R>, receiver: String, replied_to: String) -> Result<bool, String> {
+    // Copy the image from the clipboard
+    let img = handle.clipboard().read_image().unwrap();
+
     // Create the encoder directly with a Vec<u8>
     let mut png_data = Vec::new();
     let encoder = PngEncoder::new(&mut png_data);
 
     // Encode directly from pixels to PNG bytes
     encoder.write_image(
-        &pixels,            // raw pixels
-        width,              // width
-        height,             // height
-        Rgba8               // color type
+        img.rgba(),            // raw pixels
+        img.width(),           // width
+        img.height(),          // height
+        Rgba8                  // color type
     ).map_err(|e| e.to_string()).unwrap();
 
     // Generate an Attachment File
@@ -854,6 +966,7 @@ async fn react(reference_id: String, npub: String, emoji: String) -> Result<bool
         &emoji,
     )
     .build(my_public_key);
+    let rumor_id = rumor.id.unwrap();
 
     // Send reaction to the real receiver
     client
@@ -863,18 +976,27 @@ async fn react(reference_id: String, npub: String, emoji: String) -> Result<bool
 
     // Send reaction to our own public key, to allow for recovering
     match client.gift_wrap(&my_public_key, rumor, []).await {
-        Ok(response) => {
+        Ok(_) => {
             // And add our reaction locally
             let reaction = Reaction {
-                id: response.id().to_hex(),
+                id: rumor_id.to_hex(),
                 reference_id: reference_id.clone(),
                 author_id: my_public_key.to_hex(),
                 emoji,
             };
-            return Ok(STATE
-                .lock()
-                .await
-                .add_reaction(&npub, &reference_id, reaction));
+
+            // Commit it to our local state
+            let mut state = STATE.lock().await;
+            let profile = state.get_profile_mut(&npub).unwrap();
+            let chat_id = profile.id.clone();
+            let msg = profile.get_message_mut(&reference_id).unwrap();
+            let was_reaction_added_to_state = msg.add_reaction(reaction, Some(&chat_id));
+            if was_reaction_added_to_state {
+                // Save the message's reaction to our DB
+                let handle = TAURI_APP.get().unwrap();
+                db::save_message(handle.clone(), msg.clone(), npub).await.unwrap();
+            }
+            return Ok(was_reaction_added_to_state);
         }
         Err(e) => {
             eprintln!("Error: {:?}", e);
@@ -963,33 +1085,37 @@ async fn load_profile(npub: String) -> bool {
         .await
     {
         Ok(meta) => {
-            // If it's ours, mark it as such
-            let mut state = STATE.lock().await;
-            let profile_mutable = state.get_profile_mut(&npub).unwrap();
-            profile_mutable.mine = my_public_key == profile_pubkey;
+            if meta.is_some() {
+                // If it's ours, mark it as such
+                let mut state = STATE.lock().await;
+                let profile_mutable = state.get_profile_mut(&npub).unwrap();
+                profile_mutable.mine = my_public_key == profile_pubkey;
 
-            // Update the Status, and track changes
-            let status_changed = profile_mutable.status != status;
-            profile_mutable.status = status;
+                // Update the Status, and track changes
+                let status_changed = profile_mutable.status != status;
+                profile_mutable.status = status;
 
-            // Update the Metadata, and track changes
-            let metadata_changed = profile_mutable.from_metadata(meta);
+                // Update the Metadata, and track changes
+                let metadata_changed = profile_mutable.from_metadata(meta.unwrap());
 
-            // Apply the current update time
-            profile_mutable.last_updated = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
+                // Apply the current update time
+                profile_mutable.last_updated = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
 
-            // If there's any change between our Old and New profile, emit an update
-            if status_changed || metadata_changed {
-                let handle = TAURI_APP.get().unwrap();
-                handle.emit("profile_update", &profile_mutable).unwrap();
+                // If there's any change between our Old and New profile, emit an update
+                if status_changed || metadata_changed {
+                    let handle = TAURI_APP.get().unwrap();
+                    handle.emit("profile_update", &profile_mutable).unwrap();
 
-                // Cache this profile in our DB, too
-                db::set_profile(handle.clone(), profile_mutable.clone()).await.unwrap();
+                    // Cache this profile in our DB, too
+                    db::set_profile(handle.clone(), profile_mutable.clone()).await.unwrap();
+                }
+                return true;
+            } else {
+                return false;
             }
-            return true;
         }
         Err(_) => {
             return false;
@@ -1277,7 +1403,30 @@ async fn handle_event(event: Event, is_new: bool) -> bool {
                         };
 
                         // Add the reaction
-                        STATE.lock().await.add_reaction(&contact, &reference_id, reaction)
+                        // TODO: since we typically sync "backwards", a reaction may be received before we have any
+                        // ... concept of the Profile or Message, sometime in the future, we need to track these "ahead"
+                        // ... reactions and re-apply them once sync has finished.
+                        let mut state = STATE.lock().await;
+                        let maybe_profile = state.get_profile_mut(&contact);
+                        if maybe_profile.is_some() {
+                            let profile = maybe_profile.unwrap();
+                            let chat_id = profile.id.clone();
+                            let maybe_msg = profile.get_message_mut(&reference_id);
+                            if maybe_msg.is_some() {
+                                let msg = maybe_msg.unwrap();
+                                let was_reaction_added_to_state = msg.add_reaction(reaction, Some(&chat_id));
+                                if was_reaction_added_to_state {
+                                    // Save the message's reaction to our DB
+                                    let handle = TAURI_APP.get().unwrap();
+                                    db::save_message(handle.clone(), msg.clone(), contact).await.unwrap();
+                                }
+                                was_reaction_added_to_state
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
                     }
                     None => false /* No Reference (Note ID) supplied */,
                 }
@@ -2163,8 +2312,6 @@ pub fn run() {
                         // Cleanly shutdown our Nostr client
                         if let Some(nostr_client) = NOSTR_CLIENT.get() {
                             tauri::async_runtime::block_on(async {
-                                // Unsubscribe from all relay subscriptions
-                                nostr_client.unsubscribe_all().await;
                                 // Shutdown the Nostr client
                                 nostr_client.shutdown().await;
                             });

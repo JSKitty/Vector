@@ -246,6 +246,40 @@ function formatBytes(bytes, decimals = 2) {
   }
 
 /**
+ * Gets information about a file type based on its extension.
+ * @param {string} extension - The file extension (e.g., 'jpg', 'mp4', 'pdf')
+ * @returns {Object} An object containing information about the file type
+ */
+function getFileTypeInfo(extension) {
+    // Define file types with descriptions and appropriate icons
+    const fileTypes = {
+      // Images
+      "png": { description: "Picture", icon: "image" },
+      "jpg": { description: "Picture", icon: "image" },
+      "jpeg": { description: "Picture", icon: "image" },
+      "gif": { description: "GIF Animation", icon: "video" },
+      "webp": { description: "Picture", icon: "image" },
+
+      // Audio
+      "wav": { description: "Voice Message", icon: "mic-on" },
+      "mp3": { description: "Audio Clip", icon: "mic-on" },
+
+      // Videos
+      "mp4": { description: "Video", icon: "video" },
+      "webm": { description: "Video", icon: "video" },
+      "mov": { description: "Video", icon: "video" },
+      "avi": { description: "Video", icon: "video" },
+      "mkv": { description: "Video", icon: "video" }
+    };
+  
+    // Normalize the extension to lowercase
+    const normalizedExt = extension.toLowerCase();
+    
+    // Return the file type info if found, otherwise return default values
+    return fileTypes[normalizedExt] || { description: "File", icon: "attachment" };
+}
+
+/**
  * Slide out an element with animation and remove it from document flow
  * @param {HTMLElement} element - The DOM element to slide out
  * @param {Object} options - Optional configuration
