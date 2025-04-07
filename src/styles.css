@@ -153,6 +153,7 @@ body {
 
 .popup {
   position: absolute;
+  z-index: 100;
   /* Too many weird WebKit filter issues - disabling and going solid for now */
   /* backdrop-filter: blur(10px); */
   border-style: solid;
@@ -818,6 +819,7 @@ audio {
 
 .fadeout-top-msgs {
   position: absolute;
+  z-index: 100;
   /* top: is handled in JS to match the messaging UI's spacing dynamically */
   left: 0;
   right: 0;
