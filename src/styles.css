@@ -27,6 +27,10 @@
   margin: auto;
 }
 
+.icon-add-user {
+  mask-image: url("./icons/add-user.svg");
+}
+
 .icon-chats {
   mask-image: url("./icons/chats.svg");
 }
@@ -77,6 +81,10 @@
 
 .icon-chevron-down {
   mask-image: url("./icons/chevron-down.svg");
+}
+
+.icon-chevron-double-left {
+  mask-image: url("./icons/chevron-double-left.svg");
 }
 
 .icon-cancel {
@@ -307,6 +315,7 @@ body {
   margin-left: auto;
   margin-right: auto;
   color: rgba(255, 255, 255, 0.75);
+  line-height: normal;
 }
 
 .chatlist-contact img {
@@ -329,6 +338,19 @@ body {
   max-width: 50px;
 }
 
+.avatar-status-icon {
+  position: absolute;
+  bottom: 0px;
+  right: 0px;
+  width: 12px;
+  height: 12px;
+  /* Use "background-color" to explicitly set the Status Icon color */
+  border-radius: 100%;
+  border-width: 2px;
+  border-style: solid;
+  border-color: black;
+}
+
 .chatlist-contact-preview h4 {
   padding-left: 15px;
   padding-right: 15px;
@@ -345,10 +367,6 @@ body {
   text-align: left;
   font-family: 'Rubik';
   font-weight: 100;
-}
-
-#chat-new {
-  padding: 30px;
 }
 
 .chats {

@@ -1,6 +1,7 @@
 const { invoke, convertFileSrc } = window.__TAURI__.core;
 const { getVersion } = window.__TAURI__.app;
 const { getCurrentWebview } = window.__TAURI__.webview;
+const { getCurrentWindow } = window.__TAURI__.window;
 const { listen } = window.__TAURI__.event;
 const { openUrl, revealItemInDir } = window.__TAURI__.opener;
 
@@ -297,6 +298,7 @@ picker.addEventListener('click', (e) => {
  * @property {string} name - The name of the user.
  * @property {string} avatar - URL to the user's avatar image.
  * @property {Message[]} messages - An array of messages associated with the profile.
+ * @property {string} last_read - ID of the last message that was read.
  * @property {Status} status - The current status of the user.
  * @property {number} last_updated - Timestamp indicating when the profile was last updated.
  * @property {number} typing_until - Timestamp until which the user is considered typing.
@@ -308,9 +310,42 @@ picker.addEventListener('click', (e) => {
  * @typedef {Object} Message
  * @property {string} id - Unique identifier for the message.
  * @property {string} content - The content of the message.
+ * @property {string} replied_to - ID of the message this is replying to, if any.
+ * @property {Object} preview_metadata - Metadata for link previews, if any.
+ * @property {Attachment[]} attachments - Array of file attachments.
  * @property {Reaction[]} reactions - An array of reactions to this message.
  * @property {number} at - Timestamp when the message was sent.
+ * @property {boolean} pending - Whether the message is still being sent.
+ * @property {boolean} failed - Whether the message failed to send.
  * @property {boolean} mine - Indicates if this message was sent by the current user.
+ */
+
+/**
+ * Represents a file attachment in a message.
+ * @typedef {Object} Attachment
+ * @property {string} id - The unique file ID (encryption nonce).
+ * @property {string} key - The encryption key.
+ * @property {string} nonce - The encryption nonce.
+ * @property {string} extension - The file extension.
+ * @property {string} url - The host URL, typically a NIP-96 server.
+ * @property {string} path - The storage directory path.
+ * @property {number} size - The download size of the encrypted file.
+ * @property {boolean} downloading - Whether the file is currently being downloaded.
+ * @property {boolean} downloaded - Whether the file has been downloaded.
+ */
+
+/**
+ * Represents metadata for a website preview.
+ * @typedef {Object} SiteMetadata
+ * @property {string} domain - The domain of the website.
+ * @property {string} [og_title] - Open Graph title.
+ * @property {string} [og_description] - Open Graph description.
+ * @property {string} [og_image] - Open Graph image URL.
+ * @property {string} [og_url] - Open Graph URL.
+ * @property {string} [og_type] - Open Graph content type.
+ * @property {string} [title] - Website title.
+ * @property {string} [description] - Website description.
+ * @property {string} [favicon] - Website favicon URL.
  */
 
 /**
@@ -421,9 +456,17 @@ function renderChatlist() {
     }
 }
 
+/**
+ * Render a Contact for the Contact List
+ * @param {Profile} chat - The profile we're rendering
+ */
 function renderContact(chat) {
+    // Collect the Unread Message count for 'Unread' emphasis and badging
+    const nUnread = countUnreadMessages(chat);
+
     // The Contact container (The ID is the Contact's npub)
     const divContact = document.createElement('div');
+    if (nUnread) divContact.style.borderColor = '#59fcb3';
     divContact.classList.add('chatlist-contact');
     divContact.id = chat.id;
 
@@ -432,14 +475,45 @@ function renderContact(chat) {
     divPreviewContainer.classList.add('chatlist-contact-preview');
 
     // The avatar, if one exists
+    const divAvatarContainer = document.createElement('div');
+    divAvatarContainer.style.position = `relative`;
+    divAvatarContainer.style.zIndex = `-1`;
     if (chat?.avatar) {
         const imgAvatar = document.createElement('img');
         imgAvatar.src = chat?.avatar;
-        divContact.appendChild(imgAvatar);
+        divAvatarContainer.appendChild(imgAvatar);
     } else {
         // Otherwise, generate a Gradient Avatar
-        divContact.appendChild(pubkeyToAvatar(chat.id, chat?.name));
+        divAvatarContainer.appendChild(pubkeyToAvatar(chat.id, chat?.name));
     }
+
+    // Add the "Status Icon" to the avatar, then plug-in the avatar container
+    // TODO: currently, we "emulate" the status; messages in the last 5m are "online", messages in the last 30m are "away", otherwise; offline.
+    const divStatusIcon = document.createElement('div');
+    divStatusIcon.classList.add('avatar-status-icon');
+    
+    // Find the last message from the contact (not from the user)
+    let cLastContactMsg = null;
+    for (let i = chat.messages.length - 1; i >= 0; i--) {
+        if (!chat.messages[i].mine) {
+            cLastContactMsg = chat.messages[i];
+            break;
+        }
+    }
+    
+    if (cLastContactMsg && cLastContactMsg.at * 1000 > Date.now() - 60000 * 5) {
+        // set the divStatusIcon .backgroundColor to green (online)
+        divStatusIcon.style.backgroundColor = '#59fcb3';
+        divAvatarContainer.appendChild(divStatusIcon);
+    }
+    else if (cLastContactMsg && cLastContactMsg.at * 1000 > Date.now() - 60000 * 30) {
+        // set to orange (away)
+        divStatusIcon.style.backgroundColor = '#fce459';
+        divAvatarContainer.appendChild(divStatusIcon);
+    }
+    // offline... don't show status icon at all (no need to append the divStatusIcon)
+    
+    divContact.appendChild(divAvatarContainer);
 
     // Add the name (or, if missing metadata, their npub instead) to the chat preview
     const h4ContactName = document.createElement('h4');
@@ -467,16 +541,65 @@ function renderContact(chat) {
 
     // Add the Chat Preview to the contact UI
     // Note: as a hacky trick to make `divContact` receive all clicks, we set the z-index lower on it's children
-    divPreviewContainer.style.zIndex = `-1`;
+    divPreviewContainer.style.zIndex = `-1`; // Note: used to prevent the button from appearing in front of the `Popup` UI
     divContact.appendChild(divPreviewContainer);
 
     // Display the "last message" time
     const pTimeAgo = document.createElement('p');
     pTimeAgo.classList.add('chatlist-contact-timestamp');
     pTimeAgo.textContent = timeAgo(cLastMsg.at * 1000);
+    if (pTimeAgo.textContent !== 'Now') pTimeAgo.textContent += ` ago`;
+    // Apply 'Unread' final styling
+    if (nUnread) pTimeAgo.style.color = '#59fcb3';
     divContact.appendChild(pTimeAgo);
 
     return divContact;
+}
+
+/**
+ * Count the quantity of unread messages
+ * @param {Profile} profile - The Profile we're checking
+ * @returns {number} - The amount of unread messages, if any
+ */
+function countUnreadMessages(profile) {
+    // If no messages or no last_read ID, return 0
+    if (!profile.messages.length) return 0;
+    
+    // Start from the most recent message and count backward
+    let unreadCount = 0;
+    
+    // Iterate from the end of the array (most recent) backward
+    for (let i = profile.messages.length - 1; i >= 0; i--) {
+        if (profile.messages[i].mine) continue;
+
+        // If we've found the last read message, stop counting
+        if (profile.last_read && profile.messages[i].id === profile.last_read) {
+            break;
+        }
+        // Otherwise, increment the unread count
+        unreadCount++;
+    }
+    
+    return unreadCount;
+}
+
+/**
+ * Sets a specific message as the last read message in a profile
+ * @param {Profile} profile - The Profile to update
+ * @param {Message|string} message - The Message object or message ID to set as last read
+ */
+function markAsRead(profile, message) {
+    // If a Message object was provided, extract its ID
+    const messageId = typeof message === 'string' ? message : message.id;
+    
+    // Update the profile's last_read property
+    profile.last_read = messageId;
+    
+    // Notify the backend about the read status change
+    // This ensures the updated last_read value is persisted
+    if (profile.id) {
+        invoke("mark_as_read", { npub: profile.id });
+    }
 }
 
 /**
@@ -746,6 +869,9 @@ async function setupRustListeners() {
         // If this user has the open chat, then update the chat too
         if (strOpenChat === evt.payload.chat_id) {
             updateChat(arrChats.find(p => p.id === evt.payload.chat_id), [newMessage]);
+        } else {
+            // The chat of this message is not open: let's update the Unread Counters
+            invoke("update_unread_counter");
         }
 
         // Render the Chat List
@@ -850,6 +976,9 @@ async function login() {
 
                 // Setup a subscription for new websocket messages
                 invoke("notifs");
+
+                // Setup our Unread Counters
+                await invoke("update_unread_counter");
             }, { once: true });
         });
 
@@ -1033,6 +1162,23 @@ async function updateChat(profile, arrMessages = [], fClicked = false) {
         // Adjust our Contact Name class to manage space according to Status visibility
         domChatContact.classList.toggle('chat-contact', !domChatContactStatus.textContent);
         domChatContact.classList.toggle('chat-contact-with-status', !!domChatContactStatus.textContent);
+
+        // Auto-mark messages as read when chat is opened
+        if (profile?.messages?.length) {
+            // Find the latest message from the other person (not from current user)
+            let lastContactMsg = null;
+            for (let i = profile.messages.length - 1; i >= 0; i--) {
+                if (!profile.messages[i].mine) {
+                    lastContactMsg = profile.messages[i];
+                    break;
+                }
+            }
+            
+            // If we found a message and it's not already marked as read, update the read status
+            if (lastContactMsg && profile.last_read !== lastContactMsg.id) {
+                markAsRead(profile, lastContactMsg);
+            }
+        }
 
         if (!arrMessages.length) return;
 
@@ -1684,6 +1830,9 @@ function closeChat() {
     strCurrentReplyReference = "";
     cancelReply();
 
+    // Update the Chat List
+    renderChatlist();
+
     // Ensure the chat list re-adjusts to fit
     adjustSize();
 }
@@ -1855,6 +2004,31 @@ window.addEventListener("DOMContentLoaded", async () => {
         }
     });
 
+    // Hook up window focus-change events
+    await getCurrentWindow().onFocusChanged(async (event) => {
+        if (event.payload) {
+            // If we have a chat open, but Vector was prev. in the background; mark these messages as read
+            if (strOpenChat) {
+                const currentChat = arrChats.find(p => p.id === strOpenChat);
+                if (currentChat && currentChat.messages.length > 0) {
+                    // Find the last message from the contact (not from current user)
+                    let lastContactMsg = null;
+                    for (let i = currentChat.messages.length - 1; i >= 0; i--) {
+                        if (!currentChat.messages[i].mine) {
+                            lastContactMsg = currentChat.messages[i];
+                            break;
+                        }
+                    }
+                    
+                    // If we found a message, mark it as read
+                    if (lastContactMsg) {
+                        markAsRead(currentChat, lastContactMsg);
+                    }
+                }
+            }
+        }
+    });
+
     // Hook up our voice message recorder listener
     const recorder = new VoiceRecorder(domChatMessageInputVoice);
     recorder.button.addEventListener('click', async () => {
@@ -1943,7 +2117,10 @@ document.addEventListener('click', (e) => {
     }
 
     // If we're clicking a Contact, open the chat with the embedded npub (ID)
-    if (e.target.classList.contains("chatlist-contact")) return openChat(e.target.id);
+    if (e.target.classList.contains("chatlist-contact") || e.target.parentElement?.classList.contains("chatlist-contact") ||  e.target.parentElement?.parentElement?.classList.contains("chatlist-contact")) {
+        const strID = e.target.id || e.target.parentElement?.id || e.target.parentElement.parentElement.id;
+        return openChat(strID);
+    }
 
     // If we're clicking an Attachment Download button, request the download
     if (e.target.hasAttribute('download')) {
