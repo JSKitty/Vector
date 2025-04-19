@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::sync::Arc;
 use argon2::{Argon2, Params, Version};
 use lazy_static::lazy_static;
 use nostr_sdk::prelude::*;
@@ -26,8 +27,11 @@ use voice::AudioRecorder;
 
 mod net;
 
+mod upload;
+use upload::{upload_data_with_progress, ProgressCallback};
+
 mod util;
-use util::extract_https_urls;
+use util::{extract_https_urls, get_file_type_description};
 
 /// The Maximum byte size that Vector will auto-download.
 /// 
@@ -167,7 +171,14 @@ pub struct Reaction {
 pub struct Profile {
     id: String,
     name: String,
+    display_name: String,
+    lud06: String,
+    lud16: String,
+    banner: String,
     avatar: String,
+    about: String,
+    website: String,
+    nip05: String,
     messages: Vec<Message>,
     last_read: String,
     status: Status,
@@ -187,7 +198,14 @@ impl Profile {
         Self {
             id: String::new(),
             name: String::new(),
+            display_name: String::new(),
+            lud06: String::new(),
+            lud16: String::new(),
+            banner: String::new(),
             avatar: String::new(),
+            about: String::new(),
+            website: String::new(),
+            nip05: String::new(),
             messages: Vec::new(),
             last_read: String::new(),
             status: Status::new(),
@@ -233,16 +251,74 @@ impl Profile {
     fn from_metadata(&mut self, meta: Metadata) -> bool {
         let mut changed = false;
         
+        // Name
         if let Some(name) = meta.name {
             if self.name != name {
                 self.name = name;
                 changed = true;
             }
         }
+
+        // Display Name
+        if let Some(name) = meta.display_name {
+            if self.display_name != name {
+                self.display_name = name;
+                changed = true;
+            }
+        }
+
+        // lud06 (LNURL)
+        if let Some(lud06) = meta.lud06 {
+            if self.lud06 != lud06 {
+                self.lud06 = lud06;
+                changed = true;
+            }
+        }
+
+        // lud16 (Lightning Address)
+        if let Some(lud16) = meta.lud16 {
+            if self.lud16 != lud16 {
+                self.lud16 = lud16;
+                changed = true;
+            }
+        }
+
+        // Banner
+        if let Some(banner) = meta.banner {
+            if self.banner != banner {
+                self.banner = banner;
+                changed = true;
+            }
+        }
         
+        // Picture (Vector Avatar)
         if let Some(picture) = meta.picture {
             if self.avatar != picture {
                 self.avatar = picture;
+                changed = true;
+            }
+        }
+
+        // About (Vector Bio)
+        if let Some(about) = meta.about {
+            if self.about != about {
+                self.about = about;
+                changed = true;
+            }
+        }
+
+        // Website
+        if let Some(website) = meta.website {
+            if self.website != website {
+                self.website = website;
+                changed = true;
+            }
+        }
+
+        // NIP-05
+        if let Some(nip05) = meta.nip05 {
+            if self.nip05 != nip05 {
+                self.nip05 = nip05;
                 changed = true;
             }
         }
@@ -700,9 +776,10 @@ async fn message(receiver: String, content: String, replied_to: String, file: Op
         .iter()
         .filter(|m| m.pending)
         .count();
-    let pending_id = String::from("pending-") + &pending_count.to_string();
+    // Create persistent pending_id that will live for the entire function
+    let pending_id = Arc::new(String::from("pending-") + &pending_count.to_string());
     let msg = Message {
-        id: pending_id.clone(),
+        id: pending_id.as_ref().clone(),
         content,
         replied_to,
         preview_metadata: None,
@@ -718,13 +795,6 @@ async fn message(receiver: String, content: String, replied_to: String, file: Op
     };
     STATE.lock().await.add_message(&receiver, msg.clone());
 
-    // Send the pending message to our frontend
-    let handle = TAURI_APP.get().unwrap();
-    handle.emit("message_new", serde_json::json!({
-        "message": &msg,
-        "chat_id": &receiver
-    })).unwrap();
-
     // Grab our pubkey
     let client = NOSTR_CLIENT.get().expect("Nostr client not initialized");
     let signer = client.signer().await.unwrap();
@@ -734,7 +804,14 @@ async fn message(receiver: String, content: String, replied_to: String, file: Op
     let receiver_pubkey = PublicKey::from_bech32(receiver.clone().as_str()).unwrap();
 
     // Prepare the NIP-17 rumor
+    let handle = TAURI_APP.get().unwrap();
     let mut rumor = if file.is_none() {
+        // Send the text message to our frontend
+        handle.emit("message_new", serde_json::json!({
+            "message": &msg,
+            "chat_id": &receiver
+        })).unwrap();
+
         // Text Message
         EventBuilder::private_msg_rumor(receiver_pubkey, msg.content)
     } else {
@@ -746,10 +823,13 @@ async fn message(receiver: String, content: String, replied_to: String, file: Op
 
         // Update the attachment in-state
         {
+            // Use a clone of the Arc for this block
+            let pending_id_clone = Arc::clone(&pending_id);
+            
             // Retrieve the Pending Message
             let mut state = STATE.lock().await;
             let chat = state.get_profile_mut(&receiver).unwrap();
-            let message = chat.get_message_mut(&pending_id).unwrap();
+            let message = chat.get_message_mut(pending_id_clone.as_ref()).unwrap();
 
             // Choose the appropriate base directory based on platform
             let base_directory = if cfg!(target_os = "ios") {
@@ -784,9 +864,8 @@ async fn message(receiver: String, content: String, replied_to: String, file: Op
                 downloaded: true
             });
 
-            // Update the frontend
-            handle.emit("message_update", serde_json::json!({
-                "old_id": &pending_id,
+            // Send the pending file upload to our frontend
+            handle.emit("message_new", serde_json::json!({
                 "message": &message,
                 "chat_id": &receiver
             })).unwrap();
@@ -817,7 +896,21 @@ async fn message(receiver: String, content: String, replied_to: String, file: Op
         let signer = client.signer().await.unwrap();
         let conf = PRIVATE_NIP96_CONFIG.wait();
         let file_size = enc_file.len();
-        match upload_data(&signer, &conf, enc_file, Some(mime_type), None).await {
+        // Clone the Arc outside the closure for use inside a seperate-threaded progress callback
+        let pending_id_for_callback = Arc::clone(&pending_id);
+        // Create a progress callback for file uploads
+        let progress_callback: ProgressCallback = Box::new(move |percentage, _| {
+                // This is a simple callback that logs progress but could be enhanced to emit events
+                if let Some(pct) = percentage {
+                    handle.emit("attachment_upload_progress", serde_json::json!({
+                        "id": pending_id_for_callback.as_ref(),
+                        "progress": pct
+                    })).unwrap();
+                }
+            Ok(())
+        });
+
+        match upload_data_with_progress(&signer, &conf, enc_file, Some(mime_type), None, progress_callback).await {
             Ok(url) => {
                 // Create the attachment rumor
                 let attachment_rumor = EventBuilder::new(Kind::from_u16(15), url.to_string());
@@ -833,14 +926,15 @@ async fn message(receiver: String, content: String, replied_to: String, file: Op
             },
             Err(_) => {
                 // The file upload failed: so we mark the message as failed and notify of an error
+                let pending_id_for_failure = Arc::clone(&pending_id);
                 let mut state = STATE.lock().await;
                 let chat = state.get_profile_mut(&receiver).unwrap();
-                let failed_msg = chat.get_message_mut(&pending_id).unwrap();
+                let failed_msg = chat.get_message_mut(pending_id_for_failure.as_ref()).unwrap();
                 failed_msg.failed = true;
 
                 // Update the frontend
                 handle.emit("message_update", serde_json::json!({
-                    "old_id": &pending_id,
+                    "old_id": pending_id_for_failure.as_ref(),
                     "message": &failed_msg,
                     "chat_id": &receiver
                 })).unwrap();
@@ -876,15 +970,16 @@ async fn message(receiver: String, content: String, replied_to: String, file: Op
             {
                 Ok(_) => {
                     // Mark the message as a success
+                    let pending_id_for_success = Arc::clone(&pending_id);
                     let mut state = STATE.lock().await;
                     let chat = state.get_profile_mut(&receiver).unwrap();
-                    let sent_msg = chat.get_message_mut(&pending_id).unwrap();
+                    let sent_msg = chat.get_message_mut(pending_id_for_success.as_ref()).unwrap();
                     sent_msg.id = rumor_id.to_hex();
                     sent_msg.pending = false;
 
                     // Update the frontend
                     handle.emit("message_update", serde_json::json!({
-                        "old_id": &pending_id,
+                        "old_id": pending_id_for_success.as_ref(),
                         "message": &sent_msg,
                         "chat_id": &receiver
                     })).unwrap();
@@ -897,15 +992,16 @@ async fn message(receiver: String, content: String, replied_to: String, file: Op
                 Err(_) => {
                     // This is an odd case; the message was sent to the receiver, but NOT ourselves
                     // We'll class it as sent, for now...
+                    let pending_id_for_partial = Arc::clone(&pending_id);
                     let mut state = STATE.lock().await;
                     let chat = state.get_profile_mut(&receiver).unwrap();
-                    let sent_ish_msg = chat.get_message_mut(&pending_id).unwrap();
+                    let sent_ish_msg = chat.get_message_mut(pending_id_for_partial.as_ref()).unwrap();
                     sent_ish_msg.id = rumor_id.to_hex();
                     sent_ish_msg.pending = false;
 
                     // Update the frontend
                     handle.emit("message_update", serde_json::json!({
-                        "old_id": &pending_id,
+                        "old_id": pending_id_for_partial.as_ref(),
                         "message": &sent_ish_msg,
                         "chat_id": &receiver
                     })).unwrap();
@@ -919,9 +1015,10 @@ async fn message(receiver: String, content: String, replied_to: String, file: Op
         }
         Err(_) => {
             // Mark the message as a failure, bad message, bad!
+            let pending_id_for_final = Arc::clone(&pending_id);
             let mut state = STATE.lock().await;
             let chat = state.get_profile_mut(&receiver).unwrap();
-            let failed_msg = chat.get_message_mut(&pending_id).unwrap();
+            let failed_msg = chat.get_message_mut(pending_id_for_final.as_ref()).unwrap();
             failed_msg.failed = true;
             return Ok(false);
         }
@@ -1238,6 +1335,41 @@ async fn update_profile(name: String, avatar: String) -> bool {
             })
             .unwrap(),
         );
+    }
+
+    // Add display_name
+    if !profile.display_name.is_empty() {
+        meta = meta.display_name(&profile.display_name);
+    }
+
+    // Add about
+    if !profile.about.is_empty() {
+        meta = meta.about(&profile.about);
+    }
+
+    // Add website
+    if !profile.website.is_empty() {
+        meta = meta.website(Url::parse(&profile.website).unwrap());
+    }
+
+    // Add banner
+    if !profile.banner.is_empty() {
+        meta = meta.banner(Url::parse(&profile.banner).unwrap());
+    }
+
+    // Add nip05
+    if !profile.nip05.is_empty() {
+        meta = meta.nip05(&profile.nip05);
+    }
+
+    // Add lud06
+    if !profile.lud06.is_empty() {
+        meta = meta.lud06(&profile.lud06);
+    }
+
+    // Add lud16
+    if !profile.lud16.is_empty() {
+        meta = meta.lud16(&profile.lud16);
     }
 
     // Broadcast the profile update
@@ -1584,11 +1716,74 @@ async fn handle_event(event: Event, is_new: bool) -> bool {
                     downloaded = false;
                     size = reported_size;
                 }
-                // File size is good; let's attempt to download it, if we don't already have it
+                // Is it small enough to auto-download during sync? (to avoid blocking the sync thread too long)
+                else if is_new && reported_size <= 262144 { // 256 KB or less
+                    // Small file, download immediately
+                    let small_attachment = Attachment {
+                        id: decryption_nonce.to_string(),
+                        key: decryption_key.to_string(),
+                        nonce: decryption_nonce.to_string(),
+                        extension: extension.to_string(),
+                        url: content_url.clone(),
+                        path: file_path.to_string_lossy().to_string(),
+                        size: reported_size,
+                        downloading: false,
+                        downloaded: false
+                    };
+                    
+                    // Download silently (no progress reporting) with a 5-second timeout
+                    if let Ok(encrypted_data) = net::download_silent(&content_url, Some(std::time::Duration::from_secs(5))).await {
+                        // Decrypt and save the file
+                        if let Ok(_) = decrypt_and_save_attachment(handle, &encrypted_data, &small_attachment).await {
+                            // Successfully downloaded and decrypted
+                            downloaded = true;
+                        } else {
+                            // Failed to decrypt
+                            downloaded = false;
+                        }
+                    } else {
+                        // Failed to download
+                        downloaded = false;
+                    }
+                    
+                    size = reported_size;
+                }
+                // File size is good but larger than our auto-sync threshold
                 else {
                     // We'll adjust our metadata to let the frontend know this file is ready for download
                     downloaded = false;
                     size = reported_size;
+                }
+
+                // Check if the message replies to anything
+                let mut replied_to = String::new();
+                match rumor.tags.find(TagKind::e()) {
+                    Some(tag) => {
+                        if tag.is_reply() {
+                            // Add the referred Event ID to our `replied_to` field
+                            replied_to = tag.content().unwrap().to_string();
+                        }
+                    }
+                    None => (),
+                };
+
+                // Send an OS notification for incoming files
+                if !is_mine && is_new {
+                    // Find the name of the sender, if we have it
+                    let display_name = match STATE.lock().await.get_profile(&contact) {
+                        Some(profile) => {
+                            // We have a profile, just check for a name
+                            match profile.name.is_empty() {
+                                true => String::from("New Message"),
+                                false => profile.name.clone(),
+                            }
+                        }
+                        // No profile
+                        None => String::from("New Message"),
+                    };
+
+                    // Create a "description" of the attachment file
+                    show_notification(display_name, "Sent a ".to_string() + &get_file_type_description(extension));
                 }
 
                 // Create an attachment
@@ -1610,7 +1805,7 @@ async fn handle_event(event: Event, is_new: bool) -> bool {
                 let msg = Message {
                     id: rumor.id.unwrap().to_hex(),
                     content: String::new(),
-                    replied_to: String::new(),
+                    replied_to,
                     preview_metadata: None,
                     at: rumor.created_at.as_u64(),
                     attachments,
@@ -1757,6 +1952,38 @@ fn show_notification(title: String, content: String) {
     }
 }
 
+/// Decrypts and saves an attachment to disk
+/// 
+/// Returns the path to the decrypted file if successful, or an error message if unsuccessful
+async fn decrypt_and_save_attachment<R: tauri::Runtime>(
+    handle: &AppHandle<R>,
+    encrypted_data: &[u8],
+    attachment: &Attachment
+) -> Result<std::path::PathBuf, String> {
+    // Attempt to decrypt the attachment
+    let decrypted_data = crypto::decrypt_data(encrypted_data, &attachment.key, &attachment.nonce)
+        .map_err(|e| e.to_string())?;
+    
+    // Choose the appropriate base directory based on platform
+    let base_directory = if cfg!(target_os = "ios") {
+        tauri::path::BaseDirectory::Document
+    } else {
+        tauri::path::BaseDirectory::Download
+    };
+
+    // Resolve the directory path using the determined base directory
+    let dir = handle.path().resolve("vector", base_directory).unwrap();
+    let file_path = dir.join(format!("{}.{}", attachment.id, attachment.extension));
+
+    // Create the vector directory if it doesn't exist
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create directory: {}", e))?;
+
+    // Save the file to disk
+    std::fs::write(&file_path, decrypted_data).map_err(|e| format!("Failed to write file: {}", e))?;
+    
+    Ok(file_path)
+}
+
 #[tauri::command]
 async fn download_attachment(npub: String, msg_id: String, attachment_id: String) -> bool {
     // Grab the attachment's metadata
@@ -1786,82 +2013,69 @@ async fn download_attachment(npub: String, msg_id: String, attachment_id: String
         "progress": 0
     })).unwrap();
 
-    // Download dat biyatch!
-    let res = net::download(&attachment.url, handle, &attachment.id).await;
+    // Download the file - no timeout, allow large downloads to complete
+    let encrypted_data = match net::download(&attachment.url, handle, &attachment.id, None).await {
+        Ok(data) => data,
+        Err(error) => {
+            // Handle download error
+            let mut state = STATE.lock().await;
+            let mut_profile = state.get_profile_mut(&npub).unwrap();
 
-    // If there's any errors: return them
-    if res.is_err() {
-        let mut state = STATE.lock().await;
-        let mut_profile = state.get_profile_mut(&npub).unwrap();
+            // Store all necessary IDs first
+            let profile_id = mut_profile.id.clone();
+            let msg_id_clone = msg_id.clone();
+            let attachment_id_clone = attachment_id.clone();
 
-        // Store all necessary IDs first
-        let profile_id = mut_profile.id.clone();
-        let msg_id_clone = msg_id.clone();
-        let attachment_id_clone = attachment_id.clone();
+            // Update the attachment status
+            let mut_msg = mut_profile.get_message_mut(&msg_id).unwrap();
+            let mut_attachment = mut_msg.get_attachment_mut(&attachment_id).unwrap();
+            mut_attachment.downloading = false;
+            mut_attachment.downloaded = false;
 
-        // Update the attachment status
-        let mut_msg = mut_profile.get_message_mut(&msg_id).unwrap();
-        let mut_attachment = mut_msg.get_attachment_mut(&attachment_id).unwrap();
-        mut_attachment.downloading = false;
-        mut_attachment.downloaded = false;
-
-        // Emit the error
-        handle.emit("attachment_download_result", serde_json::json!({
-            "profile_id": profile_id,
-            "msg_id": msg_id_clone,
-            "id": attachment_id_clone,
-            "success": false,
-            "result": res.unwrap_err()
-        })).unwrap();
-        return false;
-    }
-
-    // Attempt to decrypt the attachment
-    let decryption = crypto::decrypt_data(res.unwrap().as_slice(), &attachment.key, &attachment.nonce);
-    if decryption.is_err() {
-        let mut state = STATE.lock().await;
-        let mut_profile = state.get_profile_mut(&npub).unwrap();
-
-        // Store all necessary IDs first
-        let profile_id = mut_profile.id.clone();
-        let msg_id_clone = msg_id.clone();
-        let attachment_id_clone = attachment_id.clone();
-
-        // Update the attachment status
-        let mut_msg = mut_profile.get_message_mut(&msg_id).unwrap();
-        let mut_attachment = mut_msg.get_attachment_mut(&attachment_id).unwrap();
-        mut_attachment.downloading = false;
-        mut_attachment.downloaded = false;
-
-        // Emit the error
-        handle.emit("attachment_download_result", serde_json::json!({
-            "profile_id": profile_id,
-            "msg_id": msg_id_clone,
-            "id": attachment_id_clone,
-            "success": false,
-            "result": decryption.unwrap_err()
-        })).unwrap();
-        return false;
-    }
-
-    // Choose the appropriate base directory based on platform
-    let base_directory = if cfg!(target_os = "ios") {
-        tauri::path::BaseDirectory::Document
-    } else {
-        tauri::path::BaseDirectory::Download
+            // Emit the error
+            handle.emit("attachment_download_result", serde_json::json!({
+                "profile_id": profile_id,
+                "msg_id": msg_id_clone,
+                "id": attachment_id_clone,
+                "success": false,
+                "result": error
+            })).unwrap();
+            return false;
+        }
     };
 
-    // Resolve the directory path using the determined base directory
-    let dir = handle.path().resolve("vector", base_directory).unwrap();
-    let file_path = dir.join(format!("{}.{}", attachment.id, attachment.extension));
+    // Decrypt and save the file
+    let result = decrypt_and_save_attachment(handle, &encrypted_data, &attachment).await;
+    
+    // Process the result
+    if let Err(error) = result {
+        // Handle decryption/saving error
+        let mut state = STATE.lock().await;
+        let mut_profile = state.get_profile_mut(&npub).unwrap();
 
-    // Create the vector directory if it doesn't exist
-    std::fs::create_dir_all(&dir).unwrap();
+        // Store all necessary IDs first
+        let profile_id = mut_profile.id.clone();
+        let msg_id_clone = msg_id.clone();
+        let attachment_id_clone = attachment_id.clone();
 
-    // Save the file to disk
-    std::fs::write(&file_path, decryption.unwrap()).unwrap();
+        // Update the attachment status
+        let mut_msg = mut_profile.get_message_mut(&msg_id).unwrap();
+        let mut_attachment = mut_msg.get_attachment_mut(&attachment_id).unwrap();
+        mut_attachment.downloading = false;
+        mut_attachment.downloaded = false;
 
-    // Grab the in-memory attachment mutably
+        // Emit the error
+        handle.emit("attachment_download_result", serde_json::json!({
+            "profile_id": profile_id,
+            "msg_id": msg_id_clone,
+            "id": attachment_id_clone,
+            "success": false,
+            "result": error
+        })).unwrap();
+        return false;
+    }
+
+    // Update state with successful download
     {
         let mut state = STATE.lock().await;
         let mut_profile = state.get_profile_mut(&npub).unwrap();
@@ -2473,7 +2687,7 @@ async fn update_unread_counter<R: Runtime>(handle: AppHandle<R>) -> u32 {
                 let _ = window.set_overlay_icon(Some(icon));
             }
             
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(not(any(target_os = "windows", target_os = "ios", target_os = "android")))]
             {
                 // On macOS, Linux, etc. use the badge if available
                 let _ = window.set_badge_count(Some(unread_count as i64));
@@ -2486,7 +2700,7 @@ async fn update_unread_counter<R: Runtime>(handle: AppHandle<R>) -> u32 {
                 let _ = window.set_overlay_icon(None);
             }
             
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(not(any(target_os = "windows", target_os = "ios", target_os = "android")))]
             {
                 // Clear the badge on other platforms
                 let _ = window.set_badge_count(None);
@@ -2499,6 +2713,13 @@ async fn update_unread_counter<R: Runtime>(handle: AppHandle<R>) -> u32 {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    {
+        // WebKitGTK can be quite funky cross-platform: as a result, we'll fallback to a more compatible renderer
+        // In theory, this will make Vector run more consistently across a wider range of Linux Desktop distros.
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_fs::init())
