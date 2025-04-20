@@ -101,33 +101,60 @@ function openEmojiPanel(e) {
             nDisplayedEmojis++;
         }
 
+        // Twemojify!
+        twemojify(emojiResults);
+
         // Setup the picker UI
         /** @type {DOMRect} */
         const rect = (isDefaultPanel ? domChatContact : e.target).getBoundingClientRect();
 
-        // Display and stick it to the right side
+        // Display the picker
         picker.style.display = `block`;
-        picker.style.right = `0px`;
 
-        // Compute it's position based on the element calling it (i.e: reactions are a floaty panel)
+        // Compute its position based on the element calling it
         const pickerRect = picker.getBoundingClientRect();
         if (isDefaultPanel) {
             // Note: No idea why the 5px extra height is needed, but this prevents the picker from overlapping too much with the chat box
             picker.style.top = `${document.body.clientHeight - pickerRect.height - rect.height - 5}px`
             picker.classList.add('emoji-picker-message-type');
+            // Set it to the right side always for the default panel
+            picker.style.right = `0px`;
             // Change the emoji button to a wink while the panel is open (removed on close)
             domChatMessageInputEmoji.innerHTML = `<span class="icon icon-wink-face"></span>`;
         } else {
             picker.classList.remove('emoji-picker-message-type');
             const fLargeMessage = rect.y < rect.height;
+            
+            // Calculate the vertical position of the picker
             const yAxisTarget = fLargeMessage ? rect.y : rect.y - rect.height;
             const yAxisCorrection = fLargeMessage ? 0 : pickerRect.height / 2;
-            picker.style.top = `${yAxisTarget + yAxisCorrection}px`;
-            // TODO: this could be more intelligent (aim for the 'e.target' location)
-            // ... however, you need to compute when the picker will overflow the app
-            // ... and prevent it, so, I'm just glue-ing it to the right for now with
-            // ... some 'groundwork' code that shouldn't be too hard to modify.
-            //picker.style.left = `${document.body.clientWidth - pickerRect.width}px`
+            
+            // Calculate if the picker would overflow the bottom of the app window
+            const pickerBottomPos = yAxisTarget + yAxisCorrection + pickerRect.height;
+            const appBottomBoundary = document.body.clientHeight;
+            const willOverflowBottom = pickerBottomPos > appBottomBoundary;
+            
+            // Set vertical position - if it will overflow the bottom, position it above the target
+            if (willOverflowBottom) {
+                picker.style.top = `${rect.y - pickerRect.height}px`;
+            } else {
+                picker.style.top = `${yAxisTarget + yAxisCorrection}px`;
+            }
+            
+            // Calculate horizontal position
+            // Try to position it next to the element that triggered it
+            const xPos = rect.x + rect.width;
+            const willOverflowRight = xPos + pickerRect.width > document.body.clientWidth;
+            
+            // If it would overflow the right side, align to right edge
+            if (willOverflowRight) {
+                picker.style.right = `0px`;
+                picker.style.left = ``;
+            } else {
+                // Position it next to the triggering element
+                picker.style.left = `${xPos}px`;
+                picker.style.right = ``;
+            }
         }
 
         // If this is a Reaction, let's cache the Reference ID
@@ -165,7 +192,6 @@ emojiSearch.addEventListener('input', (e) => {
         // In searches; the first emoji gets a special tag denoting 'Enter' key selection
         if (emojiSearch.value) {
             if (nDisplayedEmojis === 0) {
-                spanEmoji.id = 'first-emoji';
                 spanEmoji.style.opacity = 1;
             } else {
                 spanEmoji.style.opacity = 0.75;
@@ -174,6 +200,9 @@ emojiSearch.addEventListener('input', (e) => {
         emojiResults.appendChild(spanEmoji);
         nDisplayedEmojis++;
     }
+
+    // Twemojify!
+    twemojify(emojiResults);
 
     // If there's none, sad!
     if (nDisplayedEmojis === 0) {
@@ -187,8 +216,7 @@ emojiSearch.onkeydown = async (e) => {
         e.preventDefault();
 
         // Register the selection in the emoji-dex
-        const domFirstEmoji = document.getElementById('first-emoji');
-        const cEmoji = arrEmojis.find(a => a.emoji === domFirstEmoji.textContent);
+        const cEmoji = arrEmojis.find(a => a.emoji === emojiResults.firstElementChild.firstElementChild.alt);
         cEmoji.used++;
 
         // If this is a Reaction - let's send it!
@@ -205,6 +233,7 @@ emojiSearch.onkeydown = async (e) => {
                 const spanReaction = document.createElement('span');
                 spanReaction.classList.add('reaction');
                 spanReaction.textContent = `${cEmoji.emoji} 1`;
+                twemojify(spanReaction);
 
                 // Replace the Reaction button
                 // DOM Tree: msg-(them/me) -> msg-extras -> add-reaction
@@ -245,9 +274,9 @@ emojiSearch.onkeydown = async (e) => {
 
 // Emoji selection
 picker.addEventListener('click', (e) => {
-    if (e.target.tagName === 'SPAN') {
+    if (e.target.tagName === 'IMG') {
         // Register the click in the emoji-dex
-        const cEmoji = arrEmojis.find(a => a.emoji === e.target.textContent);
+        const cEmoji = arrEmojis.find(a => a.emoji === e.target.alt);
         cEmoji.used++;
 
         // If this is a Reaction - let's send it!
@@ -264,6 +293,7 @@ picker.addEventListener('click', (e) => {
                 const spanReaction = document.createElement('span');
                 spanReaction.classList.add('reaction');
                 spanReaction.textContent = `${cEmoji.emoji} 1`;
+                twemojify(spanReaction);
 
                 // Replace the Reaction button
                 // DOM Tree: msg-(them/me) -> msg-extras -> add-reaction
@@ -518,6 +548,7 @@ function renderContact(chat) {
     // Add the name (or, if missing metadata, their npub instead) to the chat preview
     const h4ContactName = document.createElement('h4');
     h4ContactName.textContent = chat?.name || chat.id;
+    if (chat?.name) twemojify(h4ContactName);
     h4ContactName.classList.add('cutoff')
     divPreviewContainer.appendChild(h4ContactName);
 
@@ -539,6 +570,7 @@ function renderContact(chat) {
     } else {
         // Not typing; display their last message
         pChatPreview.textContent = (cLastMsg.mine ? 'You: ' : '') + cLastMsg.content;
+        twemojify(pChatPreview);
     }
     divPreviewContainer.appendChild(pChatPreview);
 
@@ -1473,6 +1505,7 @@ function renderMessage(msg, sender, editID = '') {
                 spanRef = document.createElement('span');
                 spanRef.style.color = `rgba(255, 255, 255, 0.45)`;
                 spanRef.textContent = cMsg.content.length < 50 ? cMsg.content : cMsg.content.substring(0, 50) + '…';
+                twemojify(spanRef);
             } else if (cMsg.attachments.length) {
                 // For Attachments, we display an additional icon for quickly inferring the replied-to content
                 spanRef = document.createElement('div');
@@ -1521,6 +1554,9 @@ function renderMessage(msg, sender, editID = '') {
         // NOTE: the input IS HTML-sanitised, however, heavy auditing of the sanitisation method should be done, it is a bit sketchy
         spanMessage.innerHTML = parseMarkdown(msg.content.trim());
     }
+
+    // Twemojify!
+    twemojify(spanMessage);
 
     // Append the message contents
     pMessage.appendChild(spanMessage);
@@ -1699,6 +1735,7 @@ function renderMessage(msg, sender, editID = '') {
         spanReaction = document.createElement('span');
         spanReaction.classList.add('reaction');
         spanReaction.textContent = `${cReaction.emoji} ${nReacts}`;
+        twemojify(spanReaction);
     } else if (!msg.mine) {
         // No reaction on the contact's message, so let's display the 'Add Reaction' UI
         spanReaction = document.createElement('span');
@@ -1718,7 +1755,7 @@ function renderMessage(msg, sender, editID = '') {
         if (spanReaction) {
             if (msg.mine) {
                 // My message: reactions on the left
-                spanReaction.style.left = '5px';
+                spanReaction.style.marginLeft = '-10px';
             }
             divExtras.append(spanReaction);
         } else {
@@ -2148,8 +2185,12 @@ document.addEventListener('click', (e) => {
         centerInView(domMsg);
 
         // Run an animation to bring the user's eye to the message
-        domMsg.classList.add('highlight-animation');
-        return setTimeout(() => domMsg.classList.remove('highlight-animation'), 1500);
+        const pContainer = domMsg.querySelector('p');
+        if (!pContainer.classList.contains('no-background')) {
+            domMsg.classList.add('highlight-animation');
+            setTimeout(() => domMsg.classList.remove('highlight-animation'), 1500);
+        }
+        return;
     }
 
     // If we're clicking a Metadata Preview, open it's URL, if one is attached
