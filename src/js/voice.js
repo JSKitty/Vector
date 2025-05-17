@@ -33,3 +33,131 @@ class VoiceRecorder {
         }
     }
 }
+
+class VoiceTranscriptionUI {
+    constructor() {
+        this.selectedModel = 'base'; // Default model
+    }
+
+    async transcribeRecording(wavData) {
+        if (!wavData) {
+            throw new Error("No audio data to transcribe");
+        }
+        
+        return await invoke('transcribe_audio', {
+            audioData: Array.from(wavData),
+            modelId: this.selectedModel
+        });
+    }
+
+    async transcribeAudioFile(filePath) {
+        return await invoke('transcribe', {
+            filePath: filePath,
+            modelName: this.selectedModel
+        });
+    }
+}
+
+// Initialize when DOM is ready
+document.addEventListener('DOMContentLoaded', () => {
+    // Initialize voice transcription with default model
+    cTranscriber = new VoiceTranscriptionUI();
+});
+
+function handleAudioAttachment(cAttachment, assetUrl, pMessage) {
+    if (['wav', 'mp3'].includes(cAttachment.extension)) {
+        const audioContainer = document.createElement('div');
+        audioContainer.classList.add('audio-message-container');
+
+        const audPreview = document.createElement('audio');
+        audPreview.setAttribute('controlsList', 'nodownload');
+        audPreview.controls = true;
+        audPreview.preload = 'metadata';
+        audPreview.src = assetUrl;
+        audPreview.addEventListener('loadedmetadata', () => softChatScroll(), { once: true });
+
+        // Add transcribe button container
+        const transcribeContainer = document.createElement('div');
+        transcribeContainer.classList.add('transcribe-container');
+        
+        // Add view transcription button
+        const transcribeBtn = document.createElement('button');
+        transcribeBtn.classList.add('btn', 'btn-transcribe');
+        transcribeBtn.style.display = `flex`;
+        
+        const transcribeIcon = document.createElement('span');
+        transcribeIcon.classList.add('icon', 'icon-mic-on');
+        transcribeIcon.style.position = `relative`;
+        transcribeIcon.style.backgroundColor = `rgba(255, 255, 255, 0.45)`;
+        transcribeIcon.style.width = `19px`;
+        transcribeIcon.style.height = `19px`;
+        transcribeBtn.appendChild(transcribeIcon);
+        
+        const transcribeText = document.createElement('span');
+        transcribeText.textContent = `Transcribe`;
+        transcribeText.style.color = `rgba(255, 255, 255, 0.45)`;
+        transcribeText.style.marginLeft = `5px`;
+        transcribeBtn.appendChild(transcribeText);
+        
+        // Create container for transcription result
+        const transcriptionResult = document.createElement('div');
+        transcriptionResult.classList.add('transcription-result', 'hidden');
+
+        transcribeBtn.addEventListener('click', async () => {
+            // If already transcribed, just toggle visibility
+            if (transcriptionResult.textContent.trim()) {
+                transcriptionResult.classList.toggle('hidden');
+                softChatScroll();
+                return;
+            }
+
+            // Show loading state
+            transcribeBtn.disabled = true;
+            transcribeIcon.classList.replace('icon-mic', 'spinner');
+
+            try {
+                // Get the audio file path and send to backend for transcription
+                const transcription = await cTranscriber.transcribeAudioFile(cAttachment.path);
+                
+                // Clear any existing content
+                while (transcriptionResult.firstChild) {
+                    transcriptionResult.removeChild(transcriptionResult.firstChild);
+                }
+                
+                // Create transcription text container
+                const transcriptionText = document.createElement('div');
+                transcriptionText.classList.add('transcription-text');
+                
+                const p = document.createElement('span');
+                p.textContent = transcription;
+                transcriptionText.appendChild(p);
+                
+                transcriptionResult.appendChild(transcriptionText);
+                transcriptionResult.classList.remove('hidden');
+            } catch (err) {
+                console.error('Transcription error:', err);
+                
+                // Clear any existing content
+                while (transcriptionResult.firstChild) {
+                    transcriptionResult.removeChild(transcriptionResult.firstChild);
+                }
+                
+                const errorDiv = document.createElement('div');
+                errorDiv.classList.add('transcription-error');
+                errorDiv.textContent = `Error: ${err.message || 'Transcription failed'}`;
+                transcriptionResult.appendChild(errorDiv);
+                transcriptionResult.classList.remove('hidden');
+            } finally {
+                transcribeIcon.classList.replace('spinner', 'icon-mic');
+                transcribeBtn.disabled = false;
+                softChatScroll();
+            }
+        });
+
+        transcribeContainer.appendChild(transcribeBtn);
+        audioContainer.appendChild(audPreview);
+        audioContainer.appendChild(transcribeContainer);
+        audioContainer.appendChild(transcriptionResult);
+        pMessage.appendChild(audioContainer);
+    }
+}

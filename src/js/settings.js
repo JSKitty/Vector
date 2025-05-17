@@ -3,6 +3,100 @@ const { open } = window.__TAURI__.dialog;
 let MAX_AUTO_DOWNLOAD_BYTES = 10_485_760;
 
 /**
+ * @type {VoiceSettings}
+ */
+let cTranscriber = null;
+
+class VoiceSettings {
+    constructor() {
+        this.models = [
+            { id: 'tiny', name: 'Tiny', description: 'Fastest, least accurate', downloaded: false, downloading: false },
+            { id: 'base', name: 'Base', description: 'Fast, decent accuracy', downloaded: false, downloading: false },
+            { id: 'small', name: 'Small', description: 'Slower, better accuracy', downloaded: false, downloading: false },
+            { id: 'medium', name: 'Medium', description: 'Slow, good accuracy', downloaded: false, downloading: false },
+            { id: 'large-v3', name: 'Large', description: 'Very slow, best accuracy', downloaded: false, downloading: false }
+        ];
+        this.initVoiceSettings();
+    }
+
+    async initVoiceSettings() {
+        const voiceSection = document.getElementById('settings-voice');
+        if (voiceSection) {
+            voiceSection.style.display = 'block';
+            
+            // Add event listeners
+            document.getElementById('whisper-model').addEventListener('change', (e) => {
+                cTranscriber.selectedModel = e.target.value;
+                this.updateModelStatus();
+            });
+            
+            document.getElementById('download-model').addEventListener('click', () => {
+                this.downloadModel(cTranscriber.selectedModel);
+            });
+            
+            await this.checkDownloadedModels();
+            this.updateModelStatus();
+        }
+    }
+
+    async checkDownloadedModels() {
+        try {
+            const downloadedModels = await invoke('list_models');
+            this.models.forEach(model => {
+                model.downloaded = downloadedModels.find(m => m.name === model.id).downloaded;
+            });
+            this.updateModelStatus();
+        } catch (err) {
+            console.error('Error checking downloaded models:', err);
+        }
+    }
+
+    updateModelStatus() {
+        const statusElement = document.getElementById('model-status');
+        if (!statusElement) return;
+        
+        const model = this.models.find(m => m.id === cTranscriber.selectedModel);
+        if (!model) return;
+        
+        if (model.downloading) {
+            statusElement.innerHTML = `<div class="alert alert-info">Downloading ${model.name} model...</div>`;
+            return;
+        }
+        
+        if (model.downloaded) {
+            statusElement.innerHTML = `<div class="alert alert-success">${model.name} model is downloaded and ready</div>`;
+            document.getElementById('download-model').style.display = 'none';
+        } else {
+            statusElement.innerHTML = `<div class="alert alert-warning">${model.name} model is not downloaded</div>`;
+            document.getElementById('download-model').style.display = '';
+        }
+    }
+
+    async downloadModel(modelId) {
+        const model = this.models.find(m => m.id === modelId);
+        if (!model || model.downloading || model.downloaded) return;
+        
+        model.downloading = true;
+        this.updateModelStatus();
+        
+        try {
+            await invoke('download_model', { modelId });
+            model.downloaded = true;
+        } catch (err) {
+            console.error('Error downloading model:', err);
+        } finally {
+            model.downloading = false;
+            this.updateModelStatus();
+        }
+    }
+}
+
+// Initialize voice settings when DOM is ready
+document.addEventListener('DOMContentLoaded', () => {
+    window.voiceSettings = new VoiceSettings();
+});
+
+/**
  * A GUI wrapper to ask the user for a username, and apply it both
  * in-app and on the Nostr network.
  */
