@@ -30,6 +30,7 @@ use upload::{upload_data_with_progress, ProgressCallback};
 mod util;
 use util::{extract_https_urls, get_file_type_description};
 
+mod whisper;
 mod message;
 
 /// The Maximum byte size that Vector will auto-download.
@@ -2425,6 +2426,38 @@ async fn update_unread_counter<R: Runtime>(handle: AppHandle<R>) -> u32 {
     unread_count
 }
 
+#[tauri::command]
+async fn transcribe<R: Runtime>(handle: AppHandle<R>, file_path: String, model_name: String, translate: bool) -> Result<String, String> {
+    // Convert the file path to a Path
+    let path = std::path::Path::new(&file_path);
+    
+    // Check if the file exists
+    if !path.exists() {
+        return Err(format!("File does not exist: {}", file_path));
+    }
+    
+    // Read the wav file and resample
+    match whisper::resample_audio(path, 16000) {
+        Ok(audio_data) => {
+            // Pass the resampled audio to the whisper transcribe function
+            match whisper::transcribe(&handle, &model_name, translate, audio_data).await {
+                Ok(text) => Ok(text),
+                Err(e) => Err(format!("Transcription error: {}", e.to_string()))
+            }
+        },
+        Err(e) => Err(format!("Audio processing error: {}", e.to_string()))
+    }
+}
+
+#[tauri::command]
+async fn download_whisper_model<R: Runtime>(handle: AppHandle<R>, model_name: String) -> Result<String, String> {
+    // Download (or simply return the cached path of) a Whisper Model
+    match whisper::download_whisper_model(&handle, &model_name).await {
+        Ok(path) => Ok(path),
+        Err(e) => Err(format!("Model Download error: {}", e.to_string()))
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "linux")]
@@ -2501,7 +2534,11 @@ pub fn run() {
             mark_as_read,
             update_unread_counter,
             logout,
-            create_account
+            create_account,
+            transcribe,
+            download_whisper_model,
+            whisper::delete_whisper_model,
+            whisper::list_models
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

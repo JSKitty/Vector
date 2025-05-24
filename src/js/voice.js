@@ -33,3 +33,198 @@ class VoiceRecorder {
         }
     }
 }
+
+class VoiceTranscriptionUI {
+    constructor() {
+        this.isSettingUp = false;
+    }
+
+        async ensureModelReady() {
+        if (this.isSettingUp) return false;
+        
+        const selectedModel = window.voiceSettings?.selectedModel || 'small';
+        const model = window.voiceSettings?.models?.find(m => m.model.name === selectedModel);
+        if (model?.downloaded) return true;
+        
+        this.isSettingUp = true;
+        const progressContainer = document.getElementById('voice-progress-container');
+        const progressFill = document.querySelector('.voice-progress-fill');
+        const progressText = document.querySelector('.voice-progress-text');
+        
+        progressContainer.style.display = 'block';
+        progressText.textContent = 'Downloading voice model...';
+        
+        try {
+            // Set up progress listener
+            const unlisten = await window.__TAURI__.event.listen(
+                'whisper_download_progress', 
+                (event) => {
+                    const progress = event.payload.progress;
+                    progressFill.style.width = `${progress}%`;
+                    progressText.textContent = `Downloading voice model... ${progress}%`;
+                }
+            );
+
+            await window.voiceSettings.downloadModel(selectedModel);
+            unlisten();
+            
+            progressText.textContent = 'Voice model ready!';
+            setTimeout(() => {
+                progressContainer.style.display = 'none';
+                progressFill.style.width = '0%';
+            }, 1000);
+            
+            return true;
+        } catch (error) {
+            progressText.textContent = `Download failed: ${error}`;
+            progressFill.style.background = '#ff5e5e';
+            setTimeout(() => {
+                progressContainer.style.display = 'none';
+                progressFill.style.width = '0%';
+                progressFill.style.background = 'linear-gradient(90deg, #59fcb3, #00d4ff)';
+            }, 3000);
+            return false;
+        } finally {
+            this.isSettingUp = false;
+        }
+    }
+
+    async transcribeAudioFile(filePath) {
+        if (!await this.ensureModelReady()) {
+            throw new Error("Voice model setup failed");
+        }
+
+        const selectedModel = window.voiceSettings?.selectedModel || 'small';
+        return await invoke('transcribe', {
+            filePath: filePath,
+            modelName: selectedModel,
+            translate: window.voiceSettings?.autoTranslate || false
+        });
+    }
+}
+
+// Initialize when DOM is ready
+document.addEventListener('DOMContentLoaded', async () => {
+    // Initialize voice transcription with default model
+    cTranscriber = new VoiceTranscriptionUI();
+    window.voiceSettings = new VoiceSettings();
+
+    // Load our modules chronologically
+    await window.voiceSettings.loadWhisperModels();
+    window.voiceSettings.initVoiceSettings();
+});
+
+function handleAudioAttachment(cAttachment, assetUrl, pMessage, msg) {
+    if (['wav', 'mp3'].includes(cAttachment.extension)) {
+        const audioContainer = document.createElement('div');
+        audioContainer.classList.add('audio-message-container');
+
+        const audPreview = document.createElement('audio');
+        audPreview.setAttribute('controlsList', 'nodownload');
+        audPreview.controls = true;
+        audPreview.preload = 'metadata';
+        audPreview.src = assetUrl;
+        audPreview.addEventListener('loadedmetadata', () => softChatScroll(), { once: true });
+
+        // Add transcribe button container
+        const transcribeContainer = document.createElement('div');
+        transcribeContainer.classList.add('transcribe-container');
+        
+        // Add view transcription button
+        const transcribeBtn = document.createElement('button');
+        transcribeBtn.classList.add('btn', 'btn-transcribe');
+        transcribeBtn.style.display = `flex`;
+
+        const transcribeIcon = document.createElement('span');
+        transcribeIcon.classList.add('icon', 'icon-mic-on');
+        transcribeIcon.style.position = `relative`;
+        transcribeIcon.style.backgroundColor = `rgba(255, 255, 255, 0.45)`;
+        transcribeIcon.style.width = `19px`;
+        transcribeIcon.style.height = `19px`;
+        transcribeBtn.appendChild(transcribeIcon);
+        
+        const transcribeText = document.createElement('span');
+        transcribeText.textContent = `Transcribe`;
+        transcribeText.style.color = `rgba(255, 255, 255, 0.45)`;
+        transcribeText.style.marginLeft = `5px`;
+        transcribeBtn.appendChild(transcribeText);
+        
+        // Create container for transcription result
+        const transcriptionResult = document.createElement('div');
+        transcriptionResult.classList.add('transcription-result', 'hidden');
+
+        transcribeBtn.addEventListener('click', async () => {
+            if (transcribeBtn.classList.contains('loading')) return;
+
+            // If already transcribed, just toggle visibility
+            if (transcriptionResult.textContent.trim()) {
+                return transcriptionResult.classList.toggle('hidden');
+            }
+
+            // Show loading state
+            transcribeBtn.classList.add('loading');
+            transcribeText.textContent = `Transcribing`;
+            transcribeBtn.style.cursor = 'default';
+            transcribeIcon.classList.replace('icon-mic-on', 'icon-loading');
+            transcribeIcon.classList.add('spin');
+
+            try {
+                // Get the audio file path and send to backend for transcription
+                const transcription = await cTranscriber.transcribeAudioFile(cAttachment.path);
+              
+                // Remove the loading state (or, currently, the entire button)
+                transcribeBtn.remove();
+                
+                // Clear any existing content
+                while (transcriptionResult.firstChild) {
+                    transcriptionResult.removeChild(transcriptionResult.firstChild);
+                }
+                
+                // Create transcription text container
+                const transcriptionText = document.createElement('div');
+                transcriptionText.classList.add('transcription-text');
+                
+                const p = document.createElement('span');
+                p.textContent = transcription;
+                transcriptionText.appendChild(p);
+                
+                transcriptionResult.appendChild(transcriptionText);
+                transcriptionResult.classList.remove('hidden');
+            } catch (err) {
+                console.error('Transcription error:', err);
+                
+                // Clear any existing content
+                while (transcriptionResult.firstChild) {
+                    transcriptionResult.removeChild(transcriptionResult.firstChild);
+                }
+                
+                const errorDiv = document.createElement('div');
+                errorDiv.classList.add('transcription-error');
+                errorDiv.textContent = `Error: ${err.message || 'Transcription failed'}`;
+                transcriptionResult.appendChild(errorDiv);
+                transcriptionResult.classList.remove('hidden');
+            } finally {
+                transcribeIcon.classList.replace('icon-loading', 'icon-mic-on');
+                transcribeBtn.disabled = false;
+            }
+        });
+
+        transcribeContainer.appendChild(transcribeBtn);
+        audioContainer.appendChild(audPreview);
+        audioContainer.appendChild(transcribeContainer);
+        audioContainer.appendChild(transcriptionResult);
+        pMessage.appendChild(audioContainer);
+
+        // If we have auto-transcribe enabled, and this message was received in the last minute, then transcribe it!
+        if (window.voiceSettings?.autoTranscript) {
+            if (!msg.mine && msg.at > (Date.now() / 1000 - 60)) {
+                // Check if the current model is downloaded before attempting transcription
+                const selectedModel = window.voiceSettings?.selectedModel || 'small';
+                const currentModel = window.voiceSettings.models?.find(m => m.model.name === selectedModel);
+                if (currentModel?.downloaded) {
+                    transcribeBtn.click();
+                }
+            }
+        }
+    }
+}
