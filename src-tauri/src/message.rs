@@ -1,0 +1,679 @@
+use std::sync::Arc;
+use ::image::ImageEncoder;
+use nostr_sdk::prelude::*;
+use tauri::{AppHandle, Emitter, Manager, Runtime};
+use tauri_plugin_clipboard_manager::ClipboardExt;
+
+use crate::crypto;
+use crate::db;
+use crate::net;
+use crate::STATE;
+use crate::util::{self, calculate_file_hash};
+use crate::TAURI_APP;
+use crate::NOSTR_CLIENT;
+use crate::PRIVATE_NIP96_CONFIG;
+
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+pub struct Message {
+    pub id: String,
+    pub content: String,
+    pub replied_to: String,
+    pub preview_metadata: Option<net::SiteMetadata>,
+    pub attachments: Vec<Attachment>,
+    pub reactions: Vec<Reaction>,
+    pub at: u64,
+    pub pending: bool,
+    pub failed: bool,
+    pub mine: bool,
+}
+
+impl Message {
+    /// Get an attachment by ID
+    /*
+    fn get_attachment(&self, id: &str) -> Option<&Attachment> {
+        self.attachments.iter().find(|p| p.id == id)
+    }
+    */
+
+    /// Get an attachment by ID
+    pub fn get_attachment_mut(&mut self, id: &str) -> Option<&mut Attachment> {
+        self.attachments.iter_mut().find(|p| p.id == id)
+    }
+
+    /// Add a Reaction - if it was not already added
+    pub fn add_reaction(&mut self, reaction: Reaction, chat_id: Option<&str>) -> bool {
+        // Make sure we don't add the same reaction twice
+        if !self.reactions.iter().any(|r| r.id == reaction.id) {
+            self.reactions.push(reaction);
+
+            // Update the frontend if a Chat ID was provided
+            if let Some(chat) = chat_id {
+                let handle = TAURI_APP.get().unwrap();
+                handle.emit("message_update", serde_json::json!({
+                    "old_id": &self.id,
+                    "message": &self,
+                    "chat_id": chat
+                })).unwrap();
+            }
+            true
+        } else {
+            // Reaction was already added previously
+            false
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct Attachment {
+    /// The SHA256 hash of the file as a unique file ID
+    pub id: String,
+    // The encryption key
+    pub key: String,
+    // The encryption nonce
+    pub nonce: String,
+    /// The file extension
+    pub extension: String,
+    /// The host URL, typically a NIP-96 server
+    pub url: String,
+    /// The storage directory path (typically the ~/Downloads folder)
+    pub path: String,
+    /// The download size of the encrypted file
+    pub size: u64,
+    /// Whether the file is currently being downloaded or not
+    pub downloading: bool,
+    /// Whether the file has been downloaded or not
+    pub downloaded: bool,
+}
+
+impl Default for Attachment {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            key: String::new(),
+            nonce: String::new(),
+            extension: String::new(),
+            url: String::new(),
+            path: String::new(),
+            size: 0,
+            downloading: false,
+            downloaded: true,
+        }
+    }
+}
+
+/// A simple pre-upload format to associate a byte stream with a file extension
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct AttachmentFile {
+    bytes: Vec<u8>,
+    extension: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct Reaction {
+    pub id: String,
+    /// The HEX Event ID of the message being reacted to
+    pub reference_id: String,
+    /// The HEX ID of the author
+    pub author_id: String,
+    /// The emoji of the reaction
+    pub emoji: String,
+}
+
+#[tauri::command]
+pub async fn message(receiver: String, content: String, replied_to: String, file: Option<AttachmentFile>) -> Result<bool, String> {
+    // Immediately add the message to our state as "Pending" with an ID derived from the current nanosecond, we'll update it as either Sent (non-pending) or Failed in the future
+    let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+    // Create persistent pending_id that will live for the entire function
+    let pending_id = Arc::new(String::from("pending-") + &current_time.as_nanos().to_string());
+    let msg = Message {
+        id: pending_id.as_ref().clone(),
+        content,
+        replied_to,
+        preview_metadata: None,
+        at: current_time.as_secs(),
+        attachments: Vec::new(),
+        reactions: Vec::new(),
+        pending: true,
+        failed: false,
+        mine: true,
+    };
+    STATE.lock().await.add_message(&receiver, msg.clone());
+
+    // Grab our pubkey
+    let client = NOSTR_CLIENT.get().expect("Nostr client not initialized");
+    let signer = client.signer().await.unwrap();
+    let my_public_key = signer.get_public_key().await.unwrap();
+
+    // Convert the Bech32 String in to a PublicKey
+    let receiver_pubkey = PublicKey::from_bech32(receiver.clone().as_str()).unwrap();
+
+    // Prepare the NIP-17 rumor
+    let handle = TAURI_APP.get().unwrap();
+    let mut rumor = if file.is_none() {
+        // Send the text message to our frontend
+        handle.emit("message_new", serde_json::json!({
+            "message": &msg,
+            "chat_id": &receiver
+        })).unwrap();
+
+        // Text Message
+        EventBuilder::private_msg_rumor(receiver_pubkey, msg.content)
+    } else {
+        let attached_file = file.unwrap();
+
+        // Calculate the file hash first (before encryption)
+        let file_hash = calculate_file_hash(&attached_file.bytes);
+
+        // Check for existing attachment with same hash across all profiles BEFORE encrypting
+        let existing_attachment = {
+            let state = STATE.lock().await;
+            let mut found_attachment: Option<(String, Attachment)> = None;
+            
+            // Search through all profiles for an attachment with matching hash
+            for profile in &state.profiles {
+                for message in &profile.messages {
+                    for attachment in &message.attachments {
+                        if attachment.id == file_hash && !attachment.url.is_empty() {
+                            // Found a matching attachment with a valid URL
+                            found_attachment = Some((profile.id.clone(), attachment.clone()));
+                            break;
+                        }
+                    }
+                    if found_attachment.is_some() {
+                        break;
+                    }
+                }
+                if found_attachment.is_some() {
+                    break;
+                }
+            }
+            
+            found_attachment
+        };
+
+        // Only encrypt if we don't have an existing attachment (optimization)
+        let (params, enc_file) = if existing_attachment.is_some() {
+            // Skip encryption for duplicate files - we'll reuse existing encryption params
+            (crypto::EncryptionParams { key: String::new(), nonce: String::new() }, Vec::new())
+        } else {
+            // Encrypt the attachment only if it's a new file
+            let params = crypto::generate_encryption_params();
+            let enc_file = crypto::encrypt_data(attached_file.bytes.as_slice(), &params).unwrap();
+            (params, enc_file)
+        };
+
+        // Update the attachment in-state
+        {
+            // Use a clone of the Arc for this block
+            let pending_id_clone = Arc::clone(&pending_id);
+            
+            // Retrieve the Pending Message
+            let mut state = STATE.lock().await;
+            let chat = state.get_profile_mut(&receiver).unwrap();
+            let message = chat.get_message_mut(pending_id_clone.as_ref()).unwrap();
+
+            // Choose the appropriate base directory based on platform
+            let base_directory = if cfg!(target_os = "ios") {
+                tauri::path::BaseDirectory::Document
+            } else {
+                tauri::path::BaseDirectory::Download
+            };
+
+            // Resolve the directory path using the determined base directory
+            let dir = handle.path().resolve("vector", base_directory).unwrap();
+
+            // Store the hash-based file name on-disk for future reference
+            let hash_file_path = dir.join(format!("{}.{}", &file_hash, &attached_file.extension));
+
+            // Create the vector directory if it doesn't exist
+            std::fs::create_dir_all(&dir).unwrap();
+
+            // Save the hash-named file
+            std::fs::write(&hash_file_path, &attached_file.bytes).unwrap();
+
+            // Determine encryption params and file size based on whether we found an existing attachment
+            let (attachment_key, attachment_nonce, file_size) = if let Some((_, ref existing)) = existing_attachment {
+                // Reuse existing encryption params
+                (existing.key.clone(), existing.nonce.clone(), existing.size)
+            } else {
+                // Use new encryption params and encrypted file size
+                (params.key.clone(), params.nonce.clone(), enc_file.len() as u64)
+            };
+
+            // Add the Attachment in-state (with our local path, to prevent re-downloading it accidentally from server)
+            message.attachments.push(Attachment {
+                // Use SHA256 hash as the ID
+                id: file_hash.clone(),
+                key: attachment_key,
+                nonce: attachment_nonce,
+                extension: attached_file.extension.clone(),
+                url: String::new(),
+                path: hash_file_path.to_string_lossy().to_string(),
+                size: file_size,
+                downloading: false,
+                downloaded: true
+            });
+
+            // Send the pending file upload to our frontend
+            handle.emit("message_new", serde_json::json!({
+                "message": &message,
+                "chat_id": &receiver
+            })).unwrap();
+        }
+
+        // Format a Mime Type from the file extension
+        let mime_type = match attached_file.extension.as_str() {
+            // Images
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            // Audio
+            "wav" => "audio/wav",
+            "mp3" => "audio/mp3",
+            "flac" => "audio/flac",
+            "ogg" => "audio/ogg",
+            "m4a" => "audio/mp4",
+            "aac" => "audio/aac",
+            // Videos
+            "mp4" => "video/mp4",
+            "webm" => "video/webm",
+            "mov" => "video/quicktime",
+            "avi" => "video/x-msvideo",
+            "mkv" => "video/x-matroska",
+            // Unknown
+            _ => "application/octet-stream",
+        };
+
+        // Check if we found an existing attachment with the same hash
+        let mut should_upload = true;
+        let attachment_rumor = if let Some((_found_profile_id, existing_attachment)) = existing_attachment {
+            // Verify the URL is still live before reusing
+            let url_is_live = match net::check_url_live(&existing_attachment.url).await {
+                Ok(is_live) => is_live,
+                Err(_) => false // Treat errors as dead URL
+            };
+            
+            if url_is_live {
+                should_upload = false;
+                
+                // Update our pending message with the existing URL
+                {
+                    let pending_id_for_update = Arc::clone(&pending_id);
+                    let mut state = STATE.lock().await;
+                    let chat = state.get_profile_mut(&receiver).unwrap();
+                    let message = chat.get_message_mut(pending_id_for_update.as_ref()).unwrap();
+                    if let Some(attachment) = message.attachments.last_mut() {
+                        attachment.url = existing_attachment.url.clone();
+                    }
+                }
+                
+                // Create the attachment rumor with the existing URL
+                let attachment_rumor = EventBuilder::new(Kind::from_u16(15), existing_attachment.url);
+                
+                // Append decryption keys and file metadata (using existing attachment's params)
+                attachment_rumor
+                    .tag(Tag::public_key(receiver_pubkey))
+                    .tag(Tag::custom(TagKind::custom("file-type"), [mime_type]))
+                    .tag(Tag::custom(TagKind::custom("size"), [existing_attachment.size.to_string()]))
+                    .tag(Tag::custom(TagKind::custom("encryption-algorithm"), ["aes-gcm"]))
+                    .tag(Tag::custom(TagKind::custom("decryption-key"), [existing_attachment.key.as_str()]))
+                    .tag(Tag::custom(TagKind::custom("decryption-nonce"), [existing_attachment.nonce.as_str()]))
+                    .tag(Tag::custom(TagKind::custom("ox"), [file_hash.clone()]))
+            } else {
+                // URL is dead, need to upload
+                should_upload = true;
+                EventBuilder::new(Kind::from_u16(15), String::new()) // Placeholder
+            }
+        } else {
+            // No existing attachment found
+            EventBuilder::new(Kind::from_u16(15), String::new()) // Placeholder
+        };
+        
+        // Final attachment rumor - either reused or newly uploaded
+        let final_attachment_rumor = if should_upload {
+            // Upload the file to the server
+            let client = NOSTR_CLIENT.get().expect("Nostr client not initialized");
+            let signer = client.signer().await.unwrap();
+            let conf = PRIVATE_NIP96_CONFIG.wait();
+            let file_size = enc_file.len();
+            // Clone the Arc outside the closure for use inside a seperate-threaded progress callback
+            let pending_id_for_callback = Arc::clone(&pending_id);
+            // Create a progress callback for file uploads
+            let progress_callback: crate::upload::ProgressCallback = Box::new(move |percentage, _| {
+                    if let Some(pct) = percentage {
+                        handle.emit("attachment_upload_progress", serde_json::json!({
+                            "id": pending_id_for_callback.as_ref(),
+                            "progress": pct
+                        })).unwrap();
+                    }
+                Ok(())
+            });
+
+            match crate::upload::upload_data_with_progress(&signer, &conf, enc_file, Some(mime_type), None, progress_callback).await {
+                Ok(url) => {
+                    // Update our pending message with the uploaded URL
+                    {
+                        let pending_id_for_url_update = Arc::clone(&pending_id);
+                        let mut state = STATE.lock().await;
+                        let chat = state.get_profile_mut(&receiver).unwrap();
+                        let message = chat.get_message_mut(pending_id_for_url_update.as_ref()).unwrap();
+                        if let Some(attachment) = message.attachments.last_mut() {
+                            attachment.url = url.to_string();
+                        }
+                    }
+                    
+                    // Create the attachment rumor
+                    let attachment_rumor = EventBuilder::new(Kind::from_u16(15), url.to_string());
+
+                    // Append decryption keys and file metadata
+                    attachment_rumor
+                        .tag(Tag::public_key(receiver_pubkey))
+                        .tag(Tag::custom(TagKind::custom("file-type"), [mime_type]))
+                        .tag(Tag::custom(TagKind::custom("size"), [file_size.to_string()]))
+                        .tag(Tag::custom(TagKind::custom("encryption-algorithm"), ["aes-gcm"]))
+                        .tag(Tag::custom(TagKind::custom("decryption-key"), [params.key.as_str()]))
+                        .tag(Tag::custom(TagKind::custom("decryption-nonce"), [params.nonce.as_str()]))
+                        .tag(Tag::custom(TagKind::custom("ox"), [file_hash.clone()]))
+                },
+                Err(_) => {
+                    // The file upload failed: so we mark the message as failed and notify of an error
+                    let pending_id_for_failure = Arc::clone(&pending_id);
+                    let mut state = STATE.lock().await;
+                    let chat = state.get_profile_mut(&receiver).unwrap();
+                    let failed_msg = chat.get_message_mut(pending_id_for_failure.as_ref()).unwrap();
+                    failed_msg.failed = true;
+
+                    // Update the frontend
+                    handle.emit("message_update", serde_json::json!({
+                        "old_id": pending_id_for_failure.as_ref(),
+                        "message": &failed_msg,
+                        "chat_id": &receiver
+                    })).unwrap();
+
+                    // Return the error
+                    return Err(String::from("Failed to upload file"));
+                }
+            }
+        } else {
+            // We already have a valid attachment_rumor from the reuse logic
+            attachment_rumor
+        };
+        
+        // Return the final attachment rumor as the main rumor
+        final_attachment_rumor
+    };
+
+    // If a reply reference is included, add the tag
+    if !msg.replied_to.is_empty() {
+        rumor = rumor.tag(Tag::custom(
+            TagKind::e(),
+            [msg.replied_to, String::from(""), String::from("reply")],
+        ));
+    }
+
+    // Build the rumor with our key (unsigned)
+    let built_rumor = rumor.build(my_public_key);
+    let rumor_id = built_rumor.id.unwrap();
+
+    // Send message to the real receiver
+    match client
+        .gift_wrap(&receiver_pubkey, built_rumor.clone(), [])
+        .await
+    {
+        Ok(_) => {
+            // Send message to our own public key, to allow for message recovering
+            match client
+                .gift_wrap(&my_public_key, built_rumor, [])
+                .await
+            {
+                Ok(_) => {
+                    // Mark the message as a success
+                    let pending_id_for_success = Arc::clone(&pending_id);
+                    let mut state = STATE.lock().await;
+                    let chat = state.get_profile_mut(&receiver).unwrap();
+                    let sent_msg = chat.get_message_mut(pending_id_for_success.as_ref()).unwrap();
+                    sent_msg.id = rumor_id.to_hex();
+                    sent_msg.pending = false;
+
+                    // Update the frontend
+                    handle.emit("message_update", serde_json::json!({
+                        "old_id": pending_id_for_success.as_ref(),
+                        "message": &sent_msg,
+                        "chat_id": &receiver
+                    })).unwrap();
+
+                    // Save the message to our DB
+                    let handle = TAURI_APP.get().unwrap();
+                    db::save_message(handle.clone(), sent_msg.clone(), receiver).await.unwrap();
+                    return Ok(true);
+                }
+                Err(_) => {
+                    // This is an odd case; the message was sent to the receiver, but NOT ourselves
+                    // We'll class it as sent, for now...
+                    let pending_id_for_partial = Arc::clone(&pending_id);
+                    let mut state = STATE.lock().await;
+                    let chat = state.get_profile_mut(&receiver).unwrap();
+                    let sent_ish_msg = chat.get_message_mut(pending_id_for_partial.as_ref()).unwrap();
+                    sent_ish_msg.id = rumor_id.to_hex();
+                    sent_ish_msg.pending = false;
+
+                    // Update the frontend
+                    handle.emit("message_update", serde_json::json!({
+                        "old_id": pending_id_for_partial.as_ref(),
+                        "message": &sent_ish_msg,
+                        "chat_id": &receiver
+                    })).unwrap();
+
+                    // Save the message to our DB
+                    let handle = TAURI_APP.get().unwrap();
+                    db::save_message(handle.clone(), sent_ish_msg.clone(), receiver).await.unwrap();
+                    return Ok(true);
+                }
+            }
+        }
+        Err(_) => {
+            // Mark the message as a failure, bad message, bad!
+            let pending_id_for_final = Arc::clone(&pending_id);
+            let mut state = STATE.lock().await;
+            let chat = state.get_profile_mut(&receiver).unwrap();
+            let failed_msg = chat.get_message_mut(pending_id_for_final.as_ref()).unwrap();
+            failed_msg.failed = true;
+            return Ok(false);
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn paste_message<R: Runtime>(handle: AppHandle<R>, receiver: String, replied_to: String, transparent: bool) -> Result<bool, String> {
+    // Copy the image from the clipboard
+    let img = handle.clipboard().read_image().unwrap();
+
+    // Create the encoder directly with a Vec<u8>
+    let mut png_data = Vec::new();
+    let encoder = ::image::codecs::png::PngEncoder::new(&mut png_data);
+
+    // Get original pixels
+    let original_pixels = img.rgba();
+
+    // Windows: check that every image has a non-zero-ish Alpha channel, if not, this is probably a non-PNG/GIF which has had it's Alpha channel nuked
+    let mut _transparency_bug_search = false;
+    #[cfg(target_os = "windows")]
+    {
+        _transparency_bug_search = original_pixels.iter().skip(3).step_by(4).all(|&a| a <= 2);
+    }
+
+    // For non-transparent images: we need to manually account for the zero'ing out of the Alpha channel
+    let pixels = if !transparent || _transparency_bug_search {
+        // Only clone if we need to modify
+        let mut modified = original_pixels.to_vec();
+        modified.iter_mut().skip(3).step_by(4).for_each(|a| *a = 255);
+        std::borrow::Cow::Owned(modified)
+    } else {
+        // No modification needed, use the original data
+        std::borrow::Cow::Borrowed(original_pixels)
+    };
+
+    // Encode directly from pixels to PNG bytes
+    encoder.write_image(
+        &pixels,               // raw pixels
+        img.width(),           // width
+        img.height(),          // height
+        ::image::ExtendedColorType::Rgba8                  // color type
+    ).map_err(|e| e.to_string()).unwrap();
+
+    // Generate an Attachment File
+    let attachment_file = AttachmentFile {
+        bytes: png_data,
+        extension: String::from("png")
+    };
+
+    // Message the file to the intended user
+    message(receiver, String::new(), replied_to, Some(attachment_file)).await
+}
+
+#[tauri::command]
+pub async fn voice_message(receiver: String, replied_to: String, bytes: Vec<u8>) -> Result<bool, String> {
+    // Generate an Attachment File
+    let attachment_file = AttachmentFile {
+        bytes,
+        extension: String::from("wav")
+    };
+
+    // Message the file to the intended user
+    message(receiver, String::new(), replied_to, Some(attachment_file)).await
+}
+
+#[tauri::command]
+pub async fn file_message(receiver: String, replied_to: String, file_path: String) -> Result<bool, String> {
+    // Parse the file extension
+    let ext = file_path.clone().rsplit('.').next().unwrap_or("").to_lowercase();
+
+    // Load the file
+    let bytes = std::fs::read(file_path.as_str()).unwrap();
+
+    // Generate an Attachment File
+    let attachment_file = AttachmentFile {
+        bytes,
+        extension: ext.to_string()
+    };
+
+    // Message the file to the intended user
+    message(receiver, String::new(), replied_to, Some(attachment_file)).await
+}
+
+#[tauri::command]
+pub async fn react(reference_id: String, npub: String, emoji: String) -> Result<bool, ()> {
+    let client = NOSTR_CLIENT.get().expect("Nostr client not initialized");
+
+    // Prepare the EventID and Pubkeys for rumor building
+    let reference_event = EventId::from_hex(reference_id.as_str()).unwrap();
+    let receiver_pubkey = PublicKey::from_bech32(npub.as_str()).unwrap();
+
+    // Grab our pubkey
+    let signer = client.signer().await.unwrap();
+    let my_public_key = signer.get_public_key().await.unwrap();
+
+    // Build our NIP-25 Reaction rumor
+    let rumor = EventBuilder::reaction_extended(
+        reference_event,
+        receiver_pubkey,
+        Some(Kind::PrivateDirectMessage),
+        &emoji,
+    )
+    .build(my_public_key);
+    let rumor_id = rumor.id.unwrap();
+
+    // Send reaction to the real receiver
+    client
+        .gift_wrap(&receiver_pubkey, rumor.clone(), [])
+        .await
+        .unwrap();
+
+    // Send reaction to our own public key, to allow for recovering
+    match client.gift_wrap(&my_public_key, rumor, []).await {
+        Ok(_) => {
+            // And add our reaction locally
+            let reaction = Reaction {
+                id: rumor_id.to_hex(),
+                reference_id: reference_id.clone(),
+                author_id: my_public_key.to_hex(),
+                emoji,
+            };
+
+            // Commit it to our local state
+            let mut state = STATE.lock().await;
+            let profile = state.get_profile_mut(&npub).unwrap();
+            let chat_id = profile.id.clone();
+            let msg = profile.get_message_mut(&reference_id).unwrap();
+            let was_reaction_added_to_state = msg.add_reaction(reaction, Some(&chat_id));
+            if was_reaction_added_to_state {
+                // Save the message's reaction to our DB
+                let handle = TAURI_APP.get().unwrap();
+                db::save_message(handle.clone(), msg.clone(), npub).await.unwrap();
+            }
+            return Ok(was_reaction_added_to_state);
+        }
+        Err(e) => {
+            eprintln!("Error: {:?}", e);
+            return Ok(false);
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn fetch_msg_metadata(npub: String, msg_id: String) -> bool {
+    // Find the message we're extracting metadata from
+    let text = {
+        let mut state = STATE.lock().await;
+        let chat = state.get_profile_mut(&npub).unwrap();
+        let message = chat.get_message_mut(&msg_id).unwrap();
+        message.content.clone()
+    };
+
+    // Extract URLs from the message
+    const MAX_URLS_TO_TRY: usize = 3;
+    let urls = util::extract_https_urls(text.as_str());
+    if urls.is_empty() {
+        return false;
+    }
+
+    // Only try the first few URLs
+    for url in urls.into_iter().take(MAX_URLS_TO_TRY) {
+        match net::fetch_site_metadata(&url).await {
+            Ok(metadata) => {
+                let has_content = metadata.og_title.is_some() 
+                    || metadata.og_description.is_some()
+                    || metadata.og_image.is_some()
+                    || metadata.title.is_some()
+                    || metadata.description.is_some();
+
+                // Extracted metadata!
+                if has_content {
+                    // Re-fetch the message and add our metadata
+                    let mut state = STATE.lock().await;
+                    let chat = state.get_profile_mut(&npub).unwrap();
+                    let msg = chat.get_message_mut(&msg_id).unwrap();
+                    msg.preview_metadata = Some(metadata);
+
+                    // Update the renderer
+                    let handle = TAURI_APP.get().unwrap();
+                    handle.emit("message_update", serde_json::json!({
+                        "old_id": &msg_id,
+                        "message": &msg,
+                        "chat_id": &npub
+                    })).unwrap();
+
+                    // Save the new Metadata to the DB
+                    db::save_message(handle.clone(), msg.clone(), npub).await.unwrap();
+                    return true;
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    false
+}

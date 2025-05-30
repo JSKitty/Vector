@@ -6,13 +6,16 @@ use std::time::Duration;
 use std::sync::Arc;
 use std::collections::HashMap;
 
-use crate::{Profile, Status, Attachment, Message, Reaction, SiteMetadata, internal_encrypt, internal_decrypt};
+use crate::{Profile, Status, Attachment, Message, Reaction};
+use crate::net::SiteMetadata;
+use crate::crypto::{internal_encrypt, internal_decrypt};
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct VectorDB {
     pub db_version: Option<u64>,
     pub theme: Option<String>,
     pub pkey: Option<String>,
+    pub seed: Option<String>,
 }
 
 const DB_PATH: &str = "vector.json";
@@ -236,10 +239,16 @@ pub fn get_db<R: Runtime>(handle: AppHandle<R>) -> Result<VectorDB, String> {
         _ => None,
     };
     
+    let seed = match store.get("seed") {
+        Some(value) if value.is_string() => Some(value.as_str().unwrap().to_string()),
+        _ => None,
+    };
+    
     Ok(VectorDB {
         db_version,
         theme,
         pkey,
+        seed,
     })
 }
 
@@ -276,6 +285,54 @@ pub fn get_theme<R: Runtime>(handle: AppHandle<R>) -> Result<Option<String>, Str
 }
 
 #[command]
+pub fn set_whisper_auto_translate<R: Runtime>(handle: AppHandle<R>, to: bool) -> Result<(), String> {
+    let store = get_store(&handle);
+    store.set("whisper_auto_translate".to_string(), serde_json::json!(to));
+    Ok(())
+}
+
+#[command]
+pub fn get_whisper_auto_translate<R: Runtime>(handle: AppHandle<R>) -> Result<Option<bool>, String> {
+    let store = get_store(&handle);
+    match store.get("whisper_auto_translate") {
+        Some(value) if value.is_boolean() => Ok(Some(value.as_bool().unwrap())),
+        _ => Ok(None),
+    }
+}
+
+#[command]
+pub fn set_whisper_auto_transcribe<R: Runtime>(handle: AppHandle<R>, to: bool) -> Result<(), String> {
+    let store = get_store(&handle);
+    store.set("whisper_auto_transcribe".to_string(), serde_json::json!(to));
+    Ok(())
+}
+
+#[command]
+pub fn get_whisper_auto_transcribe<R: Runtime>(handle: AppHandle<R>) -> Result<Option<bool>, String> {
+    let store = get_store(&handle);
+    match store.get("whisper_auto_transcribe") {
+        Some(value) if value.is_boolean() => Ok(Some(value.as_bool().unwrap())),
+        _ => Ok(None),
+    }
+}
+
+#[command]
+pub fn set_whisper_model_name<R: Runtime>(handle: AppHandle<R>, name: String) -> Result<(), String> {
+    let store = get_store(&handle);
+    store.set("whisper_model_name".to_string(), serde_json::json!(name));
+    Ok(())
+}
+
+#[command]
+pub fn get_whisper_model_name<R: Runtime>(handle: AppHandle<R>) -> Result<Option<String>, String> {
+    let store = get_store(&handle);
+    match store.get("whisper_model_name") {
+        Some(value) if value.is_string() => Ok(Some(value.as_str().unwrap().to_string())),
+        _ => Ok(None),
+    }
+}
+
+#[command]
 pub fn set_pkey<R: Runtime>(handle: AppHandle<R>, pkey: String) -> Result<(), String> {
     let store = get_store(&handle);
     store.set("pkey".to_string(), serde_json::json!(pkey));
@@ -287,6 +344,31 @@ pub fn get_pkey<R: Runtime>(handle: AppHandle<R>) -> Result<Option<String>, Stri
     let store = get_store(&handle);
     match store.get("pkey") {
         Some(value) if value.is_string() => Ok(Some(value.as_str().unwrap().to_string())),
+        _ => Ok(None),
+    }
+}
+
+#[command]
+pub async fn set_seed<R: Runtime>(handle: AppHandle<R>, seed: String) -> Result<(), String> {
+    let store = get_store(&handle);
+    // Encrypt the seed phrase before storing it
+    let encrypted_seed = internal_encrypt(seed, None).await;
+    store.set("seed".to_string(), serde_json::json!(encrypted_seed));
+    Ok(())
+}
+
+#[command]
+pub async fn get_seed<R: Runtime>(handle: AppHandle<R>) -> Result<Option<String>, String> {
+    let store = get_store(&handle);
+    match store.get("seed") {
+        Some(value) if value.is_string() => {
+            let encrypted_seed = value.as_str().unwrap().to_string();
+            // Decrypt the seed phrase
+            match internal_decrypt(encrypted_seed, None).await {
+                Ok(decrypted) => Ok(Some(decrypted)),
+                Err(_) => Err("Failed to decrypt seed phrase".to_string()),
+            }
+        },
         _ => Ok(None),
     }
 }
