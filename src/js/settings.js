@@ -24,6 +24,7 @@ class VoiceSettings {
         // Load our Settings from disk (or use a default value)
         const strModelID = await loadChosenWhisperModel() || this.selectedModel;
         this.autoTranslate = await loadWhisperAutoTranslate();
+        this.autoTranscribe = await loadWhisperAutoTranscribe();
 
         // Set initial toggle states (will be loaded from backend DB in future)
         document.getElementById('auto-translate-toggle').checked = this.autoTranslate;
@@ -407,10 +408,11 @@ async function askForUsername() {
     const cProfile = arrChats.find(a => a.mine);
     cProfile.name = strUsername;
     renderCurrentProfile(cProfile);
+    if (domProfile.style.display === '') renderProfileTab(cProfile);
 
     // Send out the metadata update
     try {
-        await invoke("update_profile", { name: strUsername, avatar: "" });
+        await invoke("update_profile", { name: strUsername, avatar: "", banner: "" });
     } catch (e) {
         await popupConfirm('Username Update Failed!', 'An error occurred while updating your Username, the change may not have committed to the network, you can re-try any time.', true);
     }
@@ -445,12 +447,52 @@ async function askForAvatar() {
     const cProfile = arrChats.find(a => a.mine);
     cProfile.avatar = strUploadURL;
     renderCurrentProfile(cProfile);
+    if (domProfile.style.display === '') renderProfileTab(cProfile);
 
     // Send out the metadata update
     try {
-        await invoke("update_profile", { name: "", avatar: strUploadURL });
+        await invoke("update_profile", { name: "", avatar: strUploadURL, banner: "" });
     } catch (e) {
         return await popupConfirm('Avatar Update Failed!', e, true);
+    }
+}
+
+/**
+ * A GUI wrapper to ask the user for a banner URL, and apply it both
+ * in-app and on the Nostr network.
+ */
+async function askForBanner() {
+    // Prompt the user to select an image file
+    const file = await open({
+        title: 'Choose a Banner',
+        multiple: false,
+        directory: false,
+        filters: [{
+            name: 'Image',
+            extensions: ['png', 'jpeg', 'jpg', 'gif', 'webp']
+        }]
+    });
+    if (!file) return;
+
+    // Upload the banner to a NIP-96 server
+    let strUploadURL = '';
+    try {
+        strUploadURL = await invoke("upload_avatar", { filepath: file });
+    } catch (e) {
+        return await popupConfirm('Banner Upload Failed!', e, true);
+    }
+
+    // Display the change immediately
+    const cProfile = arrChats.find(a => a.mine);
+    cProfile.banner = strUploadURL;
+    renderCurrentProfile(cProfile);
+    if (domProfile.style.display === '') renderProfileTab(cProfile);
+
+    // Send out the metadata update
+    try {
+        await invoke("update_profile", { name: "", avatar: "", banner: strUploadURL });
+    } catch (e) {
+        return await popupConfirm('Banner Update Failed!', e, true);
     }
 }
 
@@ -466,6 +508,7 @@ async function askForStatus() {
     const cProfile = arrChats.find(a => a.mine);
     cProfile.status.title = strStatus;
     renderCurrentProfile(cProfile);
+    if (domProfile.style.display === '') renderProfileTab(cProfile);
 
     // Send out the metadata update
     try {
