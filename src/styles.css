@@ -316,8 +316,22 @@ body {
   margin-right: auto;
   height: 175px;
   border-radius: 100%;
+  border-color: #060606;
+  border-style: solid;
+  border-width: 8px;
   object-fit: cover;
   object-position: center;
+}
+
+.profile-description-editor {
+  resize: none;
+  background-color: transparent;
+  white-space: pre-line;
+  text-align: center;
+  width: 90% !important;
+  font-weight: 400;
+  padding: 0;
+  overscroll-behavior: none;
 }
 
 .account {
