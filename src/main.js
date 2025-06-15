@@ -429,6 +429,16 @@ let arrChats = [];
 let strOpenChat = "";
 
 /**
+ * Tracks if we're in the initial chat open period for auto-scrolling
+ */
+let chatOpenAutoScrollTimer = null;
+
+/**
+ * Tracks the timestamp when a chat was opened for media load auto-scrolling
+ */
+let chatOpenTimestamp = 0;
+
+/**
  * Synchronise all messages from the backend
  */
 async function init() {
@@ -1207,6 +1217,10 @@ function renderProfileTab(cProfile) {
     domProfileStatus.innerHTML = cProfile?.status?.title || strStatusPlaceholder;
     if (cProfile?.status?.title) twemojify(domProfileStatus);
 
+    // Adjust our Profile Name class to manage space according to Status visibility
+    domProfileName.classList.toggle('chat-contact', !domProfileStatus.textContent);
+    domProfileName.classList.toggle('chat-contact-with-status', !!domProfileStatus.textContent);
+
     // Banner
     if (cProfile.banner) {
         // We have a banner URL; so render the banner as a web image
@@ -1777,15 +1791,43 @@ function renderMessage(msg, sender, editID = '') {
 
         // If there is a message before them, and it isn't theirs, apply additional edits
         if (domPrevMsg && fIsMsg) {
-            // Curve their bottom-left border to encapsulate their message
-            const pMsg = domPrevMsg.querySelector('p');
-            if (pMsg) {
-                pMsg.style.borderBottomLeftRadius = `15px`;
+            // Check if the previous message was from the contact (!mine) 
+            const prevSenderID = domPrevMsg.getAttribute('sender');
+            const wasPrevMsgFromContact = prevSenderID !== strPubkey.substring(0, 8);
+            
+            // Only curve the previous message's bottom-left border if it was from the user (mine)
+            // If it was from the contact, we need to check if it should have a rounded corner (last in streak)
+            if (!wasPrevMsgFromContact) {
+                const pMsg = domPrevMsg.querySelector('p');
+                if (pMsg) {
+                    pMsg.style.borderBottomLeftRadius = `15px`;
+                }
+            } else {
+                // The previous message was from the contact - check if it needs rounding as last in streak
+                // Look back to see if it had previous messages from same sender
+                const prevPrevMsg = domPrevMsg.previousElementSibling;
+                const hadPreviousFromSameSender = prevPrevMsg && prevPrevMsg.getAttribute('sender') === prevSenderID;
+                
+                // Look forward to see if there are more messages from same sender after this one
+                // (which would make this a middle message, not the last)
+                const prevNextMsg = domPrevMsg.nextElementSibling;
+                const hasNextFromSameSender = prevNextMsg && prevNextMsg.getAttribute('sender') === prevSenderID;
+                
+                // Only round if it had previous messages AND no next messages from same sender (making it the last)
+                if (hadPreviousFromSameSender && !hasNextFromSameSender) {
+                    const pMsg = domPrevMsg.querySelector('p');
+                    if (pMsg && !pMsg.classList.contains('no-background')) {
+                        pMsg.style.borderBottomLeftRadius = `15px`;
+                    }
+                }
             }
 
             // Add some additional margin to separate the senders visually
             divMessage.style.marginTop = `15px`;
         }
+        
+        // Check if this is a singular message (no next message from same sender)
+        // This check happens after the message is rendered (at the end of the function)
     } else {
         // Add additional margin to simulate avatar space
         if (!msg.mine && sender?.avatar) {
@@ -1917,12 +1959,19 @@ function renderMessage(msg, sender, editID = '') {
             if (['png', 'jpeg', 'jpg', 'gif', 'webp'].includes(cAttachment.extension)) {
                 // Images
                 const imgPreview = document.createElement('img');
-                imgPreview.style.width = `100%`;
+                imgPreview.style.maxWidth = `100%`;
                 imgPreview.style.height = `auto`;
                 imgPreview.style.borderRadius = `8px`;
                 imgPreview.src = assetUrl;
-                // Add soft scroll on image load to prevent scrolling issues
-                imgPreview.addEventListener('load', softChatScroll, { once: true });
+                // Add event listener for auto-scrolling within the first 100ms of chat opening
+                imgPreview.addEventListener('load', () => {
+                    // Auto-scroll if within 100ms of chat opening
+                    if (chatOpenTimestamp && Date.now() - chatOpenTimestamp < 100) {
+                        scrollToBottom(domChatMessages, false);
+                    }
+                    // Also do soft scroll for normal layout adjustments
+                    softChatScroll();
+                }, { once: true });
                 pMessage.appendChild(imgPreview);
                 } else if (['wav', 'mp3', 'flac', 'aac', 'm4a', 'ogg'].includes(cAttachment.extension)) {
                 // Audio - use the enhanced handler with transcription
@@ -1943,7 +1992,11 @@ function renderMessage(msg, sender, editID = '') {
                 vidPreview.addEventListener('loadedmetadata', () => {
                     // Seek a tiny amount to force the frame 'poster' to load, without loading the entire video
                     vidPreview.currentTime = 0.1;
-                    // Auto-scroll to correct against the longer container
+                    // Auto-scroll if within 100ms of chat opening
+                    if (chatOpenTimestamp && Date.now() - chatOpenTimestamp < 100) {
+                        scrollToBottom(domChatMessages, false);
+                    }
+                    // Also do soft scroll for normal layout adjustments
                     softChatScroll();
                 }, { once: true });
                 pMessage.appendChild(vidPreview);
@@ -2255,6 +2308,53 @@ function renderMessage(msg, sender, editID = '') {
     if (msg.mine) divMessage.append(divExtras, pMessage);
     else divMessage.append(pMessage, divExtras);
 
+    // After rendering, check message corner styling for received messages
+    // This needs to be done post-render when the message is in the DOM
+    setTimeout(() => {
+        if (!msg.mine && domChatMessages.contains(divMessage)) {
+            const nextMsg = divMessage.nextElementSibling;
+            const prevMsg = divMessage.previousElementSibling;
+            
+            // Check if previous message exists and is from a different sender
+            const isFirstFromSender = !prevMsg || prevMsg.getAttribute('sender') !== strShortSenderID;
+            
+            // Check if next message exists and is from the same sender
+            const hasNextFromSameSender = nextMsg && nextMsg.getAttribute('sender') === strShortSenderID;
+            
+            // If we're continuing a message streak (not first from sender), we need to update the previous message
+            if (!isFirstFromSender && prevMsg) {
+                // The previous message is no longer the last in the streak, so remove its rounded corner
+                const prevPMsg = prevMsg.querySelector('p');
+                if (prevPMsg && !prevPMsg.classList.contains('no-background')) {
+                    // Check if the previous message was styled as last (had rounded corner)
+                    if (prevPMsg.style.borderBottomLeftRadius === '15px') {
+                        // Remove the rounded corner since it's no longer the last
+                        prevPMsg.style.borderBottomLeftRadius = '';
+                    }
+                }
+            }
+            
+            // Now style the current message appropriately
+            if (isFirstFromSender && !hasNextFromSameSender) {
+                // This is a singular message - apply sharp bottom-left corner
+                const pMsg = divMessage.querySelector('p');
+                if (pMsg && !pMsg.classList.contains('no-background')) {
+                    // Make the bottom-left corner sharp (0px radius)
+                    pMsg.style.borderBottomLeftRadius = '0px';
+                }
+            }
+            // If this is the last message in a multi-message streak (has previous from same sender, but no next from same sender)
+            else if (!isFirstFromSender && !hasNextFromSameSender) {
+                // This is the last message in a streak - apply rounded bottom-left corner
+                const pMsg = divMessage.querySelector('p');
+                if (pMsg && !pMsg.classList.contains('no-background')) {
+                    // Make the bottom-left corner rounded (15px radius) to close the bubble group
+                    pMsg.style.borderBottomLeftRadius = '15px';
+                }
+            }
+        }
+    }, 0);
+
     return divMessage;
 }
 
@@ -2322,6 +2422,21 @@ function openChat(contact) {
     const cProfile = arrChats.find(p => p.id === contact);
     strOpenChat = contact;
 
+    // Clear any existing auto-scroll timer
+    if (chatOpenAutoScrollTimer) {
+        clearTimeout(chatOpenAutoScrollTimer);
+        chatOpenAutoScrollTimer = null;
+    }
+
+    // Record when the chat was opened
+    chatOpenTimestamp = Date.now();
+
+    // After 100ms, stop auto-scrolling on media loads
+    chatOpenAutoScrollTimer = setTimeout(() => {
+        chatOpenTimestamp = 0; // Reset timestamp to disable auto-scrolling
+        chatOpenAutoScrollTimer = null;
+    }, 100);
+
     // TODO: enable procedural rendering when the user scrolls up, this is a temp renderer optimisation
     updateChat(cProfile, (cProfile?.messages || []).slice(-50), true);
 }
@@ -2343,6 +2458,12 @@ function openNewChat() {
  * Closes the current chat, taking the user back to the chat list
  */
 function closeChat() {
+    // Clear any auto-scroll timer
+    if (chatOpenAutoScrollTimer) {
+        clearTimeout(chatOpenAutoScrollTimer);
+        chatOpenAutoScrollTimer = null;
+    }
+
     // Attempt to completely release memory (force garbage collection...) of in-chat media
     while (domChatMessages.firstElementChild) {
         const domChild = domChatMessages.firstElementChild;
@@ -2653,12 +2774,15 @@ window.addEventListener("DOMContentLoaded", async () => {
                     nLastTypingIndicator = 0;
                 } catch(_) {}
             }
-        } else {
-            // Send a Typing Indicator
-            if (nLastTypingIndicator + 30000 < Date.now()) {
-                nLastTypingIndicator = Date.now();
-                await invoke("start_typing", { receiver: strOpenChat });
-            }
+        }
+    };
+
+    // Hook up an 'input' listener on the Message Box for typing indicators
+    domChatMessageInput.oninput = async () => {
+        // Send a Typing Indicator only when content actually changes
+        if (nLastTypingIndicator + 30000 < Date.now()) {
+            nLastTypingIndicator = Date.now();
+            await invoke("start_typing", { receiver: strOpenChat });
         }
     };
 
