@@ -708,6 +708,8 @@ async function warmupUploadServers() {
     // This simple function continually polls Vector's NIP-96 servers until configs are cached, for faster file uploads later
     while (true) {
         if (await invoke('warmup_nip96_servers')) break;
+        // If we reach here, this warmup attempt failed: sleep for a bit and try again soon
+        await sleep(5000);
     }
 }
 
@@ -1022,12 +1024,63 @@ async function setupRustListeners() {
         // Enable or Disable our notification badge Overlay Icon
         await getCurrentWindow().setOverlayIcon(evt.payload.enable ? "./icons/icon_badge_notification.png" : undefined);
     });
+
+    // Listen for relay status changes
+    await listen('relay_status_change', (evt) => {
+        // Update the relay status in the network list
+        const relayItem = document.querySelector(`[data-relay-url="${evt.payload.url}"]`);
+        if (relayItem) {
+            const statusElement = relayItem.querySelector('.relay-status');
+            if (statusElement) {
+                // Remove all status classes
+                statusElement.classList.remove('connected', 'connecting', 'disconnected', 'pending', 'initialized', 'terminated', 'banned');
+                // Add the new status class
+                statusElement.classList.add(evt.payload.status);
+                // Update the text
+                statusElement.textContent = evt.payload.status;
+            }
+        }
+    });
 }
 
 /**
  * A flag that indicates when Vector is still in it's initiation sequence
  */
 let fInit = true;
+
+/**
+ * Renders the relay list in the Settings Network section
+ */
+async function renderRelayList() {
+    try {
+        const relays = await invoke('get_relays');
+        const networkList = document.getElementById('network-list');
+        
+        // Clear existing content
+        networkList.innerHTML = '';
+        
+        // Create relay items
+        relays.forEach(relay => {
+            const relayItem = document.createElement('div');
+            relayItem.className = 'relay-item';
+            relayItem.setAttribute('data-relay-url', relay.url);
+            
+            const relayUrl = document.createElement('span');
+            relayUrl.className = 'relay-url';
+            relayUrl.textContent = relay.url;
+            
+            const relayStatus = document.createElement('span');
+            relayStatus.className = `relay-status ${relay.status}`;
+            relayStatus.textContent = relay.status;
+            
+            relayItem.appendChild(relayUrl);
+            relayItem.appendChild(relayStatus);
+            networkList.appendChild(relayItem);
+        });
+    } catch (error) {
+        console.error('Failed to fetch relays:', error);
+    }
+}
 
 /**
  * Login to the Nostr network
@@ -1136,6 +1189,12 @@ async function login() {
 
                 // Setup our Unread Counters
                 await invoke("update_unread_counter");
+
+                // Monitor relay connections
+                invoke("monitor_relay_connections");
+
+                // Render the initial relay list
+                renderRelayList();
             }, { once: true });
         });
 
@@ -1148,7 +1207,7 @@ async function login() {
 }
 
 /**
- * Renders the user's own profile UI
+ * Renders the user's own profile UI in the chat list
  * @param {Profile} cProfile 
  */
 function renderCurrentProfile(cProfile) {
@@ -1198,7 +1257,6 @@ function renderCurrentProfile(cProfile) {
     domAccount.appendChild(pStatus);
 
     /* Start Chat Tab */
-
     // Render our Share npub
     domShareNpub.textContent = strPubkey;
 }
@@ -1221,9 +1279,8 @@ function renderProfileTab(cProfile) {
     domProfileName.classList.toggle('chat-contact', !domProfileStatus.textContent);
     domProfileName.classList.toggle('chat-contact-with-status', !!domProfileStatus.textContent);
 
-    // Banner
+    // Banner - keep original structure but add click handler
     if (cProfile.banner) {
-        // We have a banner URL; so render the banner as a web image
         if (domProfileBanner.tagName === 'DIV') {
             const newBanner = document.createElement('img');
             domProfileBanner.replaceWith(newBanner);
@@ -1231,7 +1288,6 @@ function renderProfileTab(cProfile) {
         }
         domProfileBanner.src = cProfile.banner;
     } else {
-        // We don't have a banner URL; so render an empty DIV
         if (domProfileBanner.tagName === 'IMG') {
             const newBanner = document.createElement('div');
             newBanner.style.backgroundColor = 'rgb(27, 27, 27)';
@@ -1240,9 +1296,10 @@ function renderProfileTab(cProfile) {
         }
     }
     domProfileBanner.classList.add('profile-banner');
-    domProfileBanner.onclick = askForBanner;
+    domProfileBanner.onclick = cProfile.mine ? askForBanner : null;
+    if (cProfile.mine) domProfileBanner.classList.add('btn');
 
-    // Avatar
+    // Avatar - keep original structure but add click handler
     if (cProfile.avatar) {
         if (domProfileAvatar.tagName === 'DIV') {
             const newAvatar = document.createElement('img');
@@ -1256,7 +1313,8 @@ function renderProfileTab(cProfile) {
         domProfileAvatar = newAvatar;
     }
     domProfileAvatar.classList.add('profile-avatar');
-    domProfileAvatar.onclick = askForAvatar;
+    domProfileAvatar.onclick = cProfile.mine ? askForAvatar : null;
+    if (cProfile.mine) domProfileAvatar.classList.add('btn');
 
     // Secondary Display Name
     const strNamePlaceholder = cProfile.mine ? 'Set a Display Name' : '';
@@ -1266,6 +1324,12 @@ function renderProfileTab(cProfile) {
     // Secondary Status
     domProfileStatusSecondary.innerHTML = domProfileStatus.innerHTML;
 
+    // npub display
+    const profileNpub = document.getElementById('profile-npub');
+    if (profileNpub) {
+        profileNpub.textContent = cProfile.id;
+    }
+
     // Description
     const strDescriptionPlaceholder = cProfile.mine ? (cProfile?.about || 'Set an About Me') : '';
     domProfileDescription.textContent = cProfile?.about || strDescriptionPlaceholder;
@@ -1274,23 +1338,43 @@ function renderProfileTab(cProfile) {
     // npub
     domProfileId.textContent = cProfile.id;
 
+    // Add npub copy functionality
+    document.getElementById('profile-npub-copy')?.addEventListener('click', (e) => {
+        const npub = document.getElementById('profile-npub')?.textContent;
+        if (npub) {
+            navigator.clipboard.writeText(npub).then(() => {
+                const copyBtn = e.target.closest('.profile-npub-copy');
+                if (copyBtn) {
+                    copyBtn.innerHTML = '<span class="icon icon-check"></span>';
+                    setTimeout(() => {
+                        copyBtn.innerHTML = '<span class="icon icon-copy"></span>';
+                    }, 2000);
+                }
+            });
+        }
+    });
+
     // If this is OUR profile: make the elements clickable
     if (cProfile.mine) {
-        // Hide the 'Back' button and deregister it's clickable function
+        // Show edit buttons and set their click handlers
+        document.querySelector('.profile-avatar-edit').style.display = 'flex';
+        document.querySelector('.profile-avatar-edit').onclick = askForAvatar;
+        
+        document.querySelector('.profile-banner-edit').style.display = 'flex';
+        document.querySelector('.profile-banner-edit').onclick = askForBanner;
+        
+        // Hide the 'Back' button and deregister its clickable function
         domProfileBackBtn.style.display = 'none';
         domProfileBackBtn.onclick = null;
+        
         // Display the Navbar
         domNavbar.style.display = '';
 
-        // Configure clickables
+        // Configure other clickables
         domProfileName.onclick = askForUsername;
         domProfileName.classList.add('btn');
         domProfileStatus.onclick = askForStatus;
         domProfileStatus.classList.add('btn');
-        domProfileBanner.onclick = askForBanner;
-        domProfileBanner.classList.add('btn');
-        domProfileAvatar.onclick = askForAvatar;
-        domProfileAvatar.classList.add('btn');
         domProfileNameSecondary.onclick = askForUsername;
         domProfileNameSecondary.classList.add('btn');
         domProfileStatusSecondary.onclick = askForStatus;
@@ -1298,21 +1382,28 @@ function renderProfileTab(cProfile) {
         domProfileDescription.onclick = editProfileDescription;
         domProfileDescription.classList.add('btn');
     } else {
+        // Hide edit buttons
+        document.querySelector('.profile-avatar-edit').style.display = 'none';
+        document.querySelector('.profile-banner-edit').style.display = 'none';
+        
+        // Remove click handlers from avatar and banner
+        domProfileAvatar.onclick = null;
+        domProfileAvatar.classList.remove('btn');
+        domProfileBanner.onclick = null;
+        domProfileBanner.classList.remove('btn');
+        
         // Show the 'Back' button and link it to the profile's chat
         domProfileBackBtn.style.display = '';
         domProfileBackBtn.onclick = () => openChat(cProfile.id);
+        
         // Hide the Navbar
         domNavbar.style.display = 'none';
 
-        // Configure clickables
+        // Remove other clickables
         domProfileName.onclick = null;
         domProfileName.classList.remove('btn');
         domProfileStatus.onclick = null;
         domProfileStatus.classList.remove('btn');
-        domProfileBanner.onclick = null;
-        domProfileBanner.classList.remove('btn');
-        domProfileAvatar.onclick = null;
-        domProfileAvatar.classList.remove('btn');
         domProfileNameSecondary.onclick = null;
         domProfileNameSecondary.classList.remove('btn');
         domProfileStatusSecondary.onclick = null;
@@ -1978,28 +2069,44 @@ function renderMessage(msg, sender, editID = '') {
                 handleAudioAttachment(cAttachment, assetUrl, pMessage, msg);
                 } else if (['mp4', 'mov', 'webm'].includes(cAttachment.extension)) {
                 // Videos
-                const vidPreview = document.createElement('video');
-                vidPreview.setAttribute('controlsList', 'nodownload');
-                vidPreview.controls = true;
-                vidPreview.style.width = `100%`;
-                vidPreview.style.height = `auto`;
-                vidPreview.style.borderRadius = `8px`;
-                vidPreview.style.cursor = `pointer`;
-                vidPreview.preload = "metadata";
-                vidPreview.playsInline = true;
-                vidPreview.src = assetUrl;
-                // When the metadata loads, we run some maintenance tasks
-                vidPreview.addEventListener('loadedmetadata', () => {
-                    // Seek a tiny amount to force the frame 'poster' to load, without loading the entire video
-                    vidPreview.currentTime = 0.1;
+                const handleMetadataLoaded = (video) => {
+                    // Seek a tiny amount to force the frame 'poster' to load
+                    video.currentTime = 0.1;
+                    
                     // Auto-scroll if within 100ms of chat opening
                     if (chatOpenTimestamp && Date.now() - chatOpenTimestamp < 100) {
                         scrollToBottom(domChatMessages, false);
                     }
                     // Also do soft scroll for normal layout adjustments
                     softChatScroll();
-                }, { once: true });
-                pMessage.appendChild(vidPreview);
+                };
+                
+                // Platform-specific video creation
+                if (platformFeatures.os === 'android') {
+                    // Android always uses blob method with size limit
+                    createAndroidVideo(assetUrl, cAttachment, handleMetadataLoaded, (element) => {
+                        pMessage.appendChild(element);
+                    });
+                } else {
+                    // Standard video element for other platforms
+                    const vidPreview = document.createElement('video');
+                    vidPreview.setAttribute('controlsList', 'nodownload');
+                    vidPreview.controls = true;
+                    vidPreview.style.width = `100%`;
+                    vidPreview.style.height = `auto`;
+                    vidPreview.style.borderRadius = `8px`;
+                    vidPreview.style.cursor = `pointer`;
+                    vidPreview.preload = "metadata";
+                    vidPreview.playsInline = true;
+                    vidPreview.src = assetUrl;
+                    
+                    // Add metadata loaded handler
+                    vidPreview.addEventListener('loadedmetadata', () => {
+                        handleMetadataLoaded(vidPreview);
+                    }, { once: true });
+                    
+                    pMessage.appendChild(vidPreview);
+                }
             } else {
                 // Unknown attachment
                 const iUnknown = document.createElement('i');
@@ -2474,12 +2581,22 @@ function closeChat() {
             // Streamable media (audio + video) should be paused, then force-unloaded
             if (domMedia instanceof HTMLMediaElement) {
                 domMedia.pause();
-                domMedia.src = ``;
+                
+                // For Android blob URLs, revoke them before clearing
+                if (platformFeatures.os === 'android' && domMedia.src.startsWith('blob:')) {
+                    URL.revokeObjectURL(domMedia.src);
+                }
+                
+                domMedia.removeAttribute('src'); // Better than setting to empty string
                 domMedia.load();
             }
             // Static media (images) should simply be unloaded
             if (domMedia instanceof HTMLImageElement) {
-                domMedia.src = ``;
+                // Also check for blob URLs on images if you use them
+                if (domMedia.src.startsWith('blob:')) {
+                    URL.revokeObjectURL(domMedia.src);
+                }
+                domMedia.removeAttribute('src');
             }
         }
 
@@ -2645,6 +2762,9 @@ window.addEventListener("DOMContentLoaded", async () => {
     // Once login fade-in animation ends, remove it
     domLogin.addEventListener('animationend', () => domLogin.classList.remove('fadein-anim'), { once: true });
 
+    // Fetch platform features to determine OS-specific behavior
+    await fetchPlatformFeatures();
+
     // Immediately load and apply theme settings
     const strTheme = await invoke('get_theme');
     if (strTheme) {
@@ -2754,28 +2874,45 @@ window.addEventListener("DOMContentLoaded", async () => {
         }
     };
 
-    // Hook up an 'Enter' listener on the Message Box for sending messages
-    domChatMessageInput.onkeydown = async (evt) => {
-        // Allow 'Shift + Enter' to create linebreaks, while only 'Enter' sends a message
-        if ((evt.code === 'Enter' || evt.code === 'NumpadEnter') && !evt.shiftKey) {
-            evt.preventDefault();
-            if (domChatMessageInput.value.trim().length) {
-                // Cache the message and previous Input Placeholder
-                const strMessage = domChatMessageInput.value;
+    // Unified message sending function
+    async function sendMessage(messageText) {
+        if (!messageText || !messageText.trim()) return;
 
-                // Send the message, and display "Sending..." as the placeholder
-                domChatMessageInput.value = '';
-                domChatMessageInput.setAttribute('placeholder', 'Sending...');
-                try {
-                    // Reset reply selection while passing a copy of the reference to the backend
-                    const strReplyRef = strCurrentReplyReference;
-                    cancelReply();
-                    await message(strOpenChat, strMessage, strReplyRef, "");
-                    nLastTypingIndicator = 0;
-                } catch(_) {}
-            }
+        // Clear input and show sending state
+        domChatMessageInput.value = '';
+        domChatMessageInput.setAttribute('placeholder', 'Sending...');
+
+        try {
+            const replyRef = strCurrentReplyReference;
+            cancelReply();
+            await message(strOpenChat, messageText.trim(), replyRef, "");
+            nLastTypingIndicator = 0;
+        } catch(_) {}
+    }
+
+    // Desktop/iOS - traditional keydown approach
+    domChatMessageInput.addEventListener('keydown', async (evt) => {
+        if ((evt.key === 'Enter' || evt.keyCode === 13) && !evt.shiftKey) {
+            evt.preventDefault();
+            await sendMessage(domChatMessageInput.value);
         }
-    };
+    });
+
+    // Android-specific - detect newline in input
+    if (platformFeatures.os === 'android') {
+        domChatMessageInput.addEventListener('input', async (evt) => {
+            const value = domChatMessageInput.value;
+
+            // Check if input contains a newline character
+            if (value.includes('\n')) {
+                // Extract the message BEFORE clearing (remove the newline)
+                const messageText = value.replace(/\n/g, '');
+
+                // Send the message with the extracted text
+                await sendMessage(messageText);
+            }
+        });
+    }
 
     // Hook up an 'input' listener on the Message Box for typing indicators
     domChatMessageInput.oninput = async () => {
@@ -2867,9 +3004,24 @@ window.addEventListener("DOMContentLoaded", async () => {
             domChatMessageInput.setAttribute('placeholder', 'Recording...');
 
             // Start recording
-            await recorder.start();
+            if (await recorder.start() === false) {
+                // An error likely occured: reset the UI
+                cancelReply();
+                await recorder.stop();
+            }
         }
     });
+
+    // Initialize voice transcription with default model
+    window.cTranscriber = new VoiceTranscriptionUI();
+    window.voiceSettings = new VoiceSettings();
+
+    // Only load whisper models if transcription is supported
+    if (platformFeatures.transcription) {
+        await window.voiceSettings.loadWhisperModels();
+    }
+    
+    window.voiceSettings.initVoiceSettings();
 
     // Hook up our "Help Prompts" to give users easy feature explainers in ambiguous or complex contexts
     // Note: since some of these overlap with Checkbox Labels: we prevent event bubbling so that clicking the Info Icon doesn't also trigger other events
@@ -2886,6 +3038,22 @@ window.addEventListener("DOMContentLoaded", async () => {
         e.stopPropagation();
         popupConfirm('Vector Voice Transcriptions', 'Vector Voice AI can <b>automatically transcribe incoming Voice Messages</b> for immediate reading, without needing to listen.<br><br>You can decide whether Vector Voice transcribes automatically, or if you prefer to transcribe each message explicitly.', true);
     };
+
+        // Add npub copy functionality for chat-new section
+    document.getElementById('chat-new-npub-copy')?.addEventListener('click', (e) => {
+        const npub = document.getElementById('share-npub')?.textContent;
+        if (npub) {
+            navigator.clipboard.writeText(npub).then(() => {
+                const copyBtn = e.target.closest('.profile-npub-copy');
+                if (copyBtn) {
+                    copyBtn.innerHTML = '<span class="icon icon-check"></span>';
+                    setTimeout(() => {
+                        copyBtn.innerHTML = '<span class="icon icon-copy"></span>';
+                    }, 2000);
+                }
+            });
+        }
+    });
 });
 
 // Listen for app-wide click interations

@@ -21,7 +21,17 @@ mod upload;
 mod util;
 use util::{get_file_type_description, calculate_file_hash, is_nonce_filename, migrate_nonce_file_to_hash};
 
+#[cfg(target_os = "android")]
+mod android {
+    pub mod clipboard;
+    pub mod filesystem;
+    pub mod permissions;
+    pub mod utils;
+}
+
+#[cfg(not(target_os = "android"))]
 mod whisper;
+
 mod message;
 pub use message::{Message, Attachment, Reaction};
 
@@ -211,7 +221,8 @@ lazy_static! {
 #[tauri::command]
 async fn fetch_messages<R: Runtime>(
     handle: AppHandle<R>,
-    init: bool
+    init: bool,
+    relay_url: Option<String>
 ) {
     let client = NOSTR_CLIENT.get().expect("Nostr client not initialized");
 
@@ -219,7 +230,33 @@ async fn fetch_messages<R: Runtime>(
     let signer = client.signer().await.unwrap();
     let my_public_key = signer.get_public_key().await.unwrap();
 
-    // Determine the time range to fetch
+    // If relay_url is provided, this is a single-relay sync that bypasses global state
+    if relay_url.is_some() {
+        // Single relay sync - always fetch last 2 days
+        let now = Timestamp::now();
+        let two_days_ago = now.as_u64() - (60 * 60 * 24 * 2);
+        
+        let filter = Filter::new()
+            .pubkey(my_public_key)
+            .kind(Kind::GiftWrap)
+            .since(Timestamp::from_secs(two_days_ago))
+            .until(now);
+
+        // Fetch from specific relay only
+        let events = client
+            .fetch_events_from(vec![relay_url.unwrap()], filter, std::time::Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        // Process events without affecting global sync state
+        for event in events.into_iter() {
+            handle_event(event, false).await;
+        }
+        
+        return; // Exit early for single-relay syncs
+    }
+
+    // Regular sync logic with global state management
     let (since_timestamp, until_timestamp) = {
         let mut state = STATE.lock().await;
         
@@ -355,17 +392,22 @@ async fn fetch_messages<R: Runtime>(
     {
         let state = STATE.lock().await;
         if state.sync_mode == SyncMode::Finished {
-            handle.emit("sync_finished", ()).unwrap();
+            // Only emit if this is not a single-relay sync
+            if relay_url.is_none() {
+                handle.emit("sync_finished", ()).unwrap();
+            }
             return;
         }
     }
 
-    // Emit our current "Sync Range" to the frontend
-    handle.emit("sync_progress", serde_json::json!({
-        "since": since_timestamp.as_u64(),
-        "until": until_timestamp.as_u64(),
-        "mode": format!("{:?}", STATE.lock().await.sync_mode)
-    })).unwrap();
+    // Emit our current "Sync Range" to the frontend (only for general syncs, not single-relay)
+    if relay_url.is_none() {
+        handle.emit("sync_progress", serde_json::json!({
+            "since": since_timestamp.as_u64(),
+            "until": until_timestamp.as_u64(),
+            "mode": format!("{:?}", STATE.lock().await.sync_mode)
+        })).unwrap();
+    }
 
     // Fetch GiftWraps related to us within the time window
     let filter = Filter::new()
@@ -374,10 +416,19 @@ async fn fetch_messages<R: Runtime>(
         .since(since_timestamp)
         .until(until_timestamp);
 
-    let events = client
-        .fetch_events(filter, std::time::Duration::from_secs(30))
-        .await
-        .unwrap();
+    let events = if let Some(url) = &relay_url {
+        // Fetch from specific relay
+        client
+            .fetch_events_from(vec![url], filter, std::time::Duration::from_secs(30))
+            .await
+            .unwrap()
+    } else {
+        // Fetch from all relays
+        client
+            .fetch_events(filter, std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+    };
 
     // Decrypt every GiftWrap and process their contents
     let mut new_messages_count: u16 = 0;
@@ -456,7 +507,9 @@ async fn fetch_messages<R: Runtime>(
 
     if should_continue {
         // Keep synchronising
-        handle.emit("sync_slice_finished", ()).unwrap();
+        if relay_url.is_none() {
+            handle.emit("sync_slice_finished", ()).unwrap();
+        }
     } else {
         // We're done with sync
         let mut state = STATE.lock().await;
@@ -465,7 +518,9 @@ async fn fetch_messages<R: Runtime>(
         state.sync_empty_iterations = 0;
         state.sync_total_iterations = 0;
 
-        handle.emit("sync_finished", ()).unwrap();
+        if relay_url.is_none() {
+            handle.emit("sync_finished", ()).unwrap();
+        }
     }
 }
 
@@ -1328,6 +1383,133 @@ async fn notifs() -> Result<bool, String> {
     }
 }
 
+#[derive(serde::Serialize)]
+struct RelayInfo {
+    url: String,
+    status: String,
+}
+
+/// Get all relays with their current status
+#[tauri::command]
+async fn get_relays() -> Result<Vec<RelayInfo>, String> {
+    let client = NOSTR_CLIENT.get().expect("Nostr client not initialized");
+    
+    // Get all relays
+    let relays = client.relays().await;
+    
+    // Convert to our RelayInfo format
+    let relay_infos: Vec<RelayInfo> = relays
+        .into_iter()
+        .map(|(url, relay)| {
+            let status = relay.status();
+            RelayInfo {
+                url: url.to_string(),
+                status: match status {
+                    RelayStatus::Initialized => "initialized",
+                    RelayStatus::Pending => "pending",
+                    RelayStatus::Connecting => "connecting",
+                    RelayStatus::Connected => "connected",
+                    RelayStatus::Disconnected => "disconnected",
+                    RelayStatus::Terminated => "terminated",
+                    RelayStatus::Banned => "banned",
+                }.to_string(),
+            }
+        })
+        .collect();
+    
+    Ok(relay_infos)
+}
+
+/// Monitor relay pool connection status changes
+#[tauri::command]
+async fn monitor_relay_connections() -> Result<bool, String> {
+    let client = NOSTR_CLIENT.get().expect("Nostr client not initialized");
+    let handle = TAURI_APP.get().unwrap().clone();
+
+    // Get the monitor and subscribe to real-time notifications
+    let monitor = client.monitor().ok_or("Failed to get monitor")?;
+    let mut receiver = monitor.subscribe();
+    
+    // Spawn a task to handle real-time relay status notifications
+    let client_clone = client.clone();
+    let handle_clone = handle.clone();
+    tokio::spawn(async move {
+        while let Ok(notification) = receiver.recv().await {
+            match notification {
+                MonitorNotification::StatusChanged { relay_url, status } => {
+                    // Emit relay status update to frontend
+                    handle_clone.emit("relay_status_change", serde_json::json!({
+                        "url": relay_url.to_string(),
+                        "status": match status {
+                            RelayStatus::Initialized => "initialized",
+                            RelayStatus::Pending => "pending",
+                            RelayStatus::Connecting => "connecting",
+                            RelayStatus::Connected => "connected",
+                            RelayStatus::Disconnected => "disconnected",
+                            RelayStatus::Terminated => "terminated",
+                            RelayStatus::Banned => "banned",
+                        }
+                    })).unwrap();
+                    
+                    // Handle reconnection logic
+                    match status {
+                        RelayStatus::Disconnected => {
+                            // For disconnected, attempt one reconnection after delay
+                            let client_inner = client_clone.clone();
+                            let url_clone = relay_url.clone();
+                            tokio::spawn(async move {
+                                // Wait 5 seconds before attempting reconnection
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                
+                                // Try to reconnect
+                                let _ = client_inner.connect_relay(url_clone.clone()).await;
+                            });
+                        }
+                        RelayStatus::Terminated => {
+                            // Relay connection terminated (hard disconnect)
+                        }
+                        RelayStatus::Connected => {
+                            // When a relay reconnects, fetch last 2 days of messages from just that relay
+                            let handle_inner = handle_clone.clone();
+                            let url_string = relay_url.to_string();
+                            tokio::spawn(async move {
+                                // Call fetch_messages with the specific relay URL
+                                fetch_messages(handle_inner, false, Some(url_string)).await;
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    });
+    
+    // Spawn a separate task to periodically check and reconnect terminated relays
+    tokio::spawn(async move {
+        // Wait 30 seconds before starting the polling loop
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        
+        loop {
+            // Check all relays every 5 seconds
+            let relays = client.relays().await;
+            
+            for (_url, relay) in relays {
+                let status = relay.status();
+                
+                // If relay is terminated, attempt to reconnect
+                if status == RelayStatus::Terminated {
+                    let _ = relay.try_connect(std::time::Duration::from_secs(5)).await;
+                }
+            }
+            
+            // Wait 5 seconds before next check
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
+    
+    Ok(true)
+}
+
 #[tauri::command]
 fn show_notification(title: String, content: String) {
     let handle = TAURI_APP.get().unwrap();
@@ -1342,13 +1524,33 @@ fn show_notification(title: String, content: String) {
         .is_focused()
         .unwrap()
     {
-        handle
-            .notification()
-            .builder()
-            .title(title)
-            .body(content)
-            .show()
-            .unwrap_or_else(|e| eprintln!("Failed to send notification: {}", e));
+        #[cfg(target_os = "android")]
+        {
+            handle
+                .notification()
+                .builder()
+                .title(title)
+                .body(&content)
+                .large_body(&content)
+                // Android-specific notification extensions
+                .icon("ic_notification")
+                .summary("Private Message")
+                .large_icon("ic_large_icon")
+                .show()
+                .unwrap_or_else(|e| eprintln!("Failed to send notification: {}", e));
+        }
+        
+        #[cfg(not(target_os = "android"))]
+        {
+            handle
+                .notification()
+                .builder()
+                .title(title)
+                .body(&content)
+                .large_body(&content)
+                .show()
+                .unwrap_or_else(|e| eprintln!("Failed to send notification: {}", e));
+        }
     }
 }
 
@@ -1608,6 +1810,7 @@ async fn login(import_key: String) -> Result<LoginKeyPair, String> {
     let client = Client::builder()
         .signer(keys.clone())
         .opts(Options::new().gossip(false))
+        .monitor(Monitor::new(1024))
         .build();
     NOSTR_CLIENT.set(client).unwrap();
 
@@ -1636,12 +1839,11 @@ async fn connect() -> bool {
     }
 
     // Add our 'Trusted Relay' (see Rustdoc for TRUSTED_RELAY for more info)
-    client.add_relay(TRUSTED_RELAY).await.unwrap();
+    client.pool().add_relay(TRUSTED_RELAY, RelayOptions::new().reconnect(false)).await.unwrap();
 
-    // Add a couple common relays, especially with explicit NIP-17 support (thanks 0xchat!)
-    client.add_relay("wss://relay.0xchat.com").await.unwrap();
-    client.add_relay("wss://auth.nostr1.com").await.unwrap();
-    client.add_relay("wss://relay.damus.io").await.unwrap();
+    // Add a couple common Nostr relays
+    client.pool().add_relay("wss://auth.nostr1.com", RelayOptions::new().reconnect(false)).await.unwrap();
+    client.pool().add_relay("wss://relay.damus.io", RelayOptions::new().reconnect(false)).await.unwrap();
 
     // Connect!
     client.connect().await;
@@ -1676,6 +1878,19 @@ async fn decrypt(ciphertext: String, password: Option<String>) -> Result<String,
 
 #[tauri::command]
 async fn start_recording() -> Result<(), String> {
+    #[cfg(target_os = "android")] 
+    {
+        // Check if we already have permission
+        if !android::permissions::check_audio_permission().unwrap() {
+            // This will block until the user responds to the permission dialog
+            let granted = android::permissions::request_audio_permission_blocking()?;
+            
+            if !granted {
+                return Err("Audio permission denied by user".to_string());
+            }
+        }
+    }
+
     AudioRecorder::global().start()
 }
 
@@ -1710,6 +1925,7 @@ async fn create_account() -> Result<LoginKeyPair, String> {
     let client = Client::builder()
         .signer(keys.clone())
         .opts(Options::new().gossip(false))
+        .monitor(Monitor::new(1024))
         .build();
     NOSTR_CLIENT.set(client).unwrap();
 
@@ -1731,6 +1947,37 @@ async fn create_account() -> Result<LoginKeyPair, String> {
 }
 
 /// Updates the OS taskbar badge with the count of unread messages
+/// Platform feature list structure
+#[derive(serde::Serialize, Clone)]
+struct PlatformFeatures {
+    transcription: bool,
+    os: String,
+    // Add more features here as needed
+}
+
+/// Returns a list of platform-specific features available
+#[tauri::command]
+async fn get_platform_features() -> PlatformFeatures {
+    let os = if cfg!(target_os = "android") {
+        "android"
+    } else if cfg!(target_os = "ios") {
+        "ios"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        "unknown"
+    };
+
+    PlatformFeatures {
+        transcription: !cfg!(target_os = "android"),
+        os: os.to_string(),
+    }
+}
+
 #[tauri::command]
 async fn update_unread_counter<R: Runtime>(handle: AppHandle<R>) -> u32 {
     // Get the count of unread messages from the state
@@ -1774,6 +2021,7 @@ async fn update_unread_counter<R: Runtime>(handle: AppHandle<R>) -> u32 {
     unread_count
 }
 
+#[cfg(not(target_os = "android"))]
 #[tauri::command]
 async fn transcribe<R: Runtime>(handle: AppHandle<R>, file_path: String, model_name: String, translate: bool) -> Result<whisper::TranscriptionResult, String> {
     // Convert the file path to a Path
@@ -1797,6 +2045,13 @@ async fn transcribe<R: Runtime>(handle: AppHandle<R>, file_path: String, model_n
     }
 }
 
+#[cfg(target_os = "android")]
+#[tauri::command]
+async fn transcribe<R: Runtime>(_handle: AppHandle<R>, _file_path: String, _model_name: String, _translate: bool) -> Result<String, String> {
+    Err("Whisper transcription is not supported on Android".to_string())
+}
+
+#[cfg(not(target_os = "android"))]
 #[tauri::command]
 async fn download_whisper_model<R: Runtime>(handle: AppHandle<R>, model_name: String) -> Result<String, String> {
     // Download (or simply return the cached path of) a Whisper Model
@@ -1804,6 +2059,12 @@ async fn download_whisper_model<R: Runtime>(handle: AppHandle<R>, model_name: St
         Ok(path) => Ok(path),
         Err(e) => Err(format!("Model Download error: {}", e.to_string()))
     }
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+async fn download_whisper_model<R: Runtime>(_handle: AppHandle<R>, _model_name: String) -> Result<String, String> {
+    Err("Whisper model download is not supported on Android".to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1959,6 +2220,8 @@ pub fn run() {
             download_attachment,
             login,
             notifs,
+            get_relays,
+            monitor_relay_connections,
             start_typing,
             connect,
             encrypt,
@@ -1968,9 +2231,14 @@ pub fn run() {
             update_unread_counter,
             logout,
             create_account,
+            get_platform_features,
+            #[cfg(not(target_os = "android"))]
             transcribe,
+            #[cfg(not(target_os = "android"))]
             download_whisper_model,
+            #[cfg(not(target_os = "android"))]
             whisper::delete_whisper_model,
+            #[cfg(not(target_os = "android"))]
             whisper::list_models
         ])
         .run(tauri::generate_context!())

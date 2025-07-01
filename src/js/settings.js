@@ -3,6 +3,23 @@ const { open } = window.__TAURI__.dialog;
 let MAX_AUTO_DOWNLOAD_BYTES = 10_485_760;
 
 /**
+ * Platform features retrieved from the backend
+ * @typedef {Object} PlatformFeatures
+ * @property {boolean} transcription - Whether transcriptions are enabled
+ * @property {"android" | "ios" | "macos" | "windows" | "linux" | "unknown"} os - The operating system
+ */
+
+/** @type {PlatformFeatures} */
+let platformFeatures = null;
+
+/**
+ * Fetch platform features from the backend
+ */
+async function fetchPlatformFeatures() {
+    platformFeatures = await invoke("get_platform_features");
+}
+
+/**
  * @type {VoiceTranscriptionUI}
  */
 let cTranscriber = null;
@@ -18,6 +35,12 @@ class VoiceSettings {
     async initVoiceSettings() {
         const voiceSection = document.getElementById('settings-voice');
         if (!voiceSection) return;
+
+        // Only show voice settings if transcription is supported
+        if (!platformFeatures.transcription) {
+            voiceSection.style.display = 'none';
+            return;
+        }
 
         voiceSection.style.display = 'block';
 
@@ -548,13 +571,12 @@ async function selectFile() {
  * @param {string} mode - The theme mode, i.e: light, dark
  */
 async function setTheme(theme = 'vector', mode = 'dark') {
-    domTheme.href = `/themes/${theme}/${mode}.css`;
-
-    // Ensure the value of the Theme Selector matches (i.e: at bootup during theme load)
-    domSettingsThemeSelect.value = theme;
-
-    // Save the selection to DB
-    await invoke('set_theme', { theme: theme });
+  document.body.classList.remove('vector-theme', 'chatstr-theme');
+  document.body.classList.add(`${theme}-theme`);
+  
+  domTheme.href = `/themes/${theme}/${mode}.css`;
+  domSettingsThemeSelect.value = theme;
+  await invoke('set_theme', { theme: theme });
 }
 
 // Apply Theme changes in real-time

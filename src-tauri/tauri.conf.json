@@ -19,7 +19,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self' ipc: http://ipc.localhost; img-src 'self' data: https: asset: http://asset.localhost; media-src 'self' https: asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; connect-src 'self' asset: http://asset.localhost",
+      "csp": "default-src 'self' ipc: http://ipc.localhost; img-src 'self' data: https: asset: http://asset.localhost; media-src 'self' https: asset: http://asset.localhost blob:; style-src 'self' 'unsafe-inline'; connect-src 'self' asset: http://asset.localhost",
       "assetProtocol": {
         "enable": true,
         "scope": ["$DOWNLOAD/vector/*", "$DOCUMENT/vector/*"]
@@ -47,6 +47,9 @@
           "y": 70
         }
 			}
+    },
+    "android": {
+      "minSdkVersion": 26
     },
     "icon": [
       "icons/32x32.png",

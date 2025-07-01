@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use ::image::ImageEncoder;
+use ::image::{ImageBuffer, ImageEncoder, Rgba};
 use blurhash;
 use nostr_sdk::prelude::*;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
@@ -13,6 +13,9 @@ use crate::util::{self, calculate_file_hash};
 use crate::TAURI_APP;
 use crate::NOSTR_CLIENT;
 use crate::PRIVATE_NIP96_CONFIG;
+
+#[cfg(target_os = "android")]
+use crate::android::{clipboard, filesystem};
 
 #[derive(serde::Serialize, Clone, Debug, PartialEq)]
 pub struct Message {
@@ -119,10 +122,10 @@ impl Default for Attachment {
 /// A simple pre-upload format to associate a byte stream with a file extension
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct AttachmentFile {
-    bytes: Vec<u8>,
+    pub bytes: Vec<u8>,
     /// Image metadata (for images only)
-    img_meta: Option<ImageMetadata>,
-    extension: String,
+    pub img_meta: Option<ImageMetadata>,
+    pub extension: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
@@ -134,6 +137,22 @@ pub struct Reaction {
     pub author_id: String,
     /// The emoji of the reaction
     pub emoji: String,
+}
+
+/// Helper function to mark message as failed and update frontend
+async fn mark_message_failed(pending_id: Arc<String>, receiver: &str) {
+    let mut state = STATE.lock().await;
+    let chat = state.get_profile_mut(receiver).unwrap();
+    let failed_msg = chat.get_message_mut(pending_id.as_ref()).unwrap();
+    failed_msg.failed = true;
+
+    // Update the frontend
+    let handle = TAURI_APP.get().unwrap();
+    handle.emit("message_update", serde_json::json!({
+        "old_id": pending_id.as_ref(),
+        "message": &failed_msg,
+        "chat_id": receiver
+    })).unwrap();
 }
 
 #[tauri::command]
@@ -378,7 +397,8 @@ pub async fn message(receiver: String, content: String, replied_to: String, file
                 Ok(())
             });
 
-            match crate::upload::upload_data_with_progress(&signer, &conf, enc_file, Some(mime_type), None, progress_callback).await {
+            // Upload the file with both a Progress Emitter and multiple re-try attempts in case of connection instability
+            match crate::upload::upload_data_with_progress(&signer, &conf, enc_file, Some(mime_type), None, progress_callback, Some(3), Some(std::time::Duration::from_secs(2))).await {
                 Ok(url) => {
                     // Update our pending message with the uploaded URL
                     {
@@ -414,19 +434,7 @@ pub async fn message(receiver: String, content: String, replied_to: String, file
                 },
                 Err(_) => {
                     // The file upload failed: so we mark the message as failed and notify of an error
-                    let pending_id_for_failure = Arc::clone(&pending_id);
-                    let mut state = STATE.lock().await;
-                    let chat = state.get_profile_mut(&receiver).unwrap();
-                    let failed_msg = chat.get_message_mut(pending_id_for_failure.as_ref()).unwrap();
-                    failed_msg.failed = true;
-
-                    // Update the frontend
-                    handle.emit("message_update", serde_json::json!({
-                        "old_id": pending_id_for_failure.as_ref(),
-                        "message": &failed_msg,
-                        "chat_id": &receiver
-                    })).unwrap();
-
+                    mark_message_failed(Arc::clone(&pending_id), &receiver).await;
                     // Return the error
                     return Err(String::from("Failed to upload file"));
                 }
@@ -452,94 +460,156 @@ pub async fn message(receiver: String, content: String, replied_to: String, file
     let built_rumor = rumor.build(my_public_key);
     let rumor_id = built_rumor.id.unwrap();
 
-    // Send message to the real receiver
+    // Send message to the real receiver with retry logic
+    let mut send_attempts = 0;
+    const MAX_ATTEMPTS: u32 = 12;
+    const RETRY_DELAY_MS: u64 = 5; // 5 seconds
+
+    let mut final_output = None;
+
+    while send_attempts < MAX_ATTEMPTS {
+        send_attempts += 1;
+        
+        match client
+            .gift_wrap(&receiver_pubkey, built_rumor.clone(), [])
+            .await
+        {
+            Ok(output) => {
+                // Check if at least one relay acknowledged the message
+                if !output.success.is_empty() {
+                    // Success! Message was acknowledged by at least one relay
+                    final_output = Some(output);
+                    break;
+                } else if output.failed.is_empty() {
+                    // No success but also no failures - this might be a temporary network issue
+                    // Continue retrying
+                } else {
+                    // We have failures but no successes
+                    if send_attempts == MAX_ATTEMPTS {
+                        // Final attempt failed
+                        mark_message_failed(Arc::clone(&pending_id), &receiver).await;
+                        return Ok(false);
+                    }
+                }
+                
+                // If we're here and haven't reached max attempts, wait before retrying
+                if send_attempts < MAX_ATTEMPTS {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                }
+            }
+            Err(e) => {
+                // Network or other error - log and retry if we haven't exceeded attempts
+                eprintln!("Failed to send message (attempt {}/{}): {:?}", send_attempts, MAX_ATTEMPTS, e);
+                
+                if send_attempts == MAX_ATTEMPTS {
+                    // Final attempt failed
+                    mark_message_failed(Arc::clone(&pending_id), &receiver).await;
+                    return Ok(false);
+                }
+                
+                // Wait before retrying
+                tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+            }
+        }
+    }
+    
+    // If we get here without final_output, all attempts failed
+    if final_output.is_none() {
+        mark_message_failed(Arc::clone(&pending_id), &receiver).await;
+        return Ok(false);
+    }
+
+    // Send message to our own public key, to allow for message recovering
     match client
-        .gift_wrap(&receiver_pubkey, built_rumor.clone(), [])
+        .gift_wrap(&my_public_key, built_rumor, [])
         .await
     {
         Ok(_) => {
-            // Send message to our own public key, to allow for message recovering
-            match client
-                .gift_wrap(&my_public_key, built_rumor, [])
-                .await
-            {
-                Ok(_) => {
-                    // Mark the message as a success
-                    let pending_id_for_success = Arc::clone(&pending_id);
-                    let mut state = STATE.lock().await;
-                    let chat = state.get_profile_mut(&receiver).unwrap();
-                    let sent_msg = chat.get_message_mut(pending_id_for_success.as_ref()).unwrap();
-                    sent_msg.id = rumor_id.to_hex();
-                    sent_msg.pending = false;
-
-                    // Update the frontend
-                    handle.emit("message_update", serde_json::json!({
-                        "old_id": pending_id_for_success.as_ref(),
-                        "message": &sent_msg,
-                        "chat_id": &receiver
-                    })).unwrap();
-
-                    // Save the message to our DB
-                    let handle = TAURI_APP.get().unwrap();
-                    db::save_message(handle.clone(), sent_msg.clone(), receiver).await.unwrap();
-                    return Ok(true);
-                }
-                Err(_) => {
-                    // This is an odd case; the message was sent to the receiver, but NOT ourselves
-                    // We'll class it as sent, for now...
-                    let pending_id_for_partial = Arc::clone(&pending_id);
-                    let mut state = STATE.lock().await;
-                    let chat = state.get_profile_mut(&receiver).unwrap();
-                    let sent_ish_msg = chat.get_message_mut(pending_id_for_partial.as_ref()).unwrap();
-                    sent_ish_msg.id = rumor_id.to_hex();
-                    sent_ish_msg.pending = false;
-
-                    // Update the frontend
-                    handle.emit("message_update", serde_json::json!({
-                        "old_id": pending_id_for_partial.as_ref(),
-                        "message": &sent_ish_msg,
-                        "chat_id": &receiver
-                    })).unwrap();
-
-                    // Save the message to our DB
-                    let handle = TAURI_APP.get().unwrap();
-                    db::save_message(handle.clone(), sent_ish_msg.clone(), receiver).await.unwrap();
-                    return Ok(true);
-                }
-            }
-        }
-        Err(_) => {
-            // Mark the message as a failure, bad message, bad!
-            let pending_id_for_final = Arc::clone(&pending_id);
+            // Mark the message as a success
+            let pending_id_for_success = Arc::clone(&pending_id);
             let mut state = STATE.lock().await;
             let chat = state.get_profile_mut(&receiver).unwrap();
-            let failed_msg = chat.get_message_mut(pending_id_for_final.as_ref()).unwrap();
-            failed_msg.failed = true;
-            return Ok(false);
+            let sent_msg = chat.get_message_mut(pending_id_for_success.as_ref()).unwrap();
+            sent_msg.id = rumor_id.to_hex();
+            sent_msg.pending = false;
+
+            // Update the frontend
+            handle.emit("message_update", serde_json::json!({
+                "old_id": pending_id_for_success.as_ref(),
+                "message": &sent_msg,
+                "chat_id": &receiver
+            })).unwrap();
+
+            // Save the message to our DB
+            let handle = TAURI_APP.get().unwrap();
+            db::save_message(handle.clone(), sent_msg.clone(), receiver).await.unwrap();
+            return Ok(true);
+        }
+        Err(_) => {
+            // This is an odd case; the message was sent to the receiver, but NOT ourselves
+            // We'll class it as sent, for now...
+            let pending_id_for_partial = Arc::clone(&pending_id);
+            let mut state = STATE.lock().await;
+            let chat = state.get_profile_mut(&receiver).unwrap();
+            let sent_ish_msg = chat.get_message_mut(pending_id_for_partial.as_ref()).unwrap();
+            sent_ish_msg.id = rumor_id.to_hex();
+            sent_ish_msg.pending = false;
+
+            // Update the frontend
+            handle.emit("message_update", serde_json::json!({
+                "old_id": pending_id_for_partial.as_ref(),
+                "message": &sent_ish_msg,
+                "chat_id": &receiver
+            })).unwrap();
+
+            // Save the message to our DB
+            let handle = TAURI_APP.get().unwrap();
+            db::save_message(handle.clone(), sent_ish_msg.clone(), receiver).await.unwrap();
+            return Ok(true);
         }
     }
 }
 
 #[tauri::command]
 pub async fn paste_message<R: Runtime>(handle: AppHandle<R>, receiver: String, replied_to: String, transparent: bool) -> Result<bool, String> {
-    // Copy the image from the clipboard
-    let img = handle.clipboard().read_image().unwrap();
+    // Platform-specific clipboard reading
+    #[cfg(target_os = "android")]
+    let img = {
+        use crate::android::clipboard::read_image_from_clipboard;
+        read_image_from_clipboard()?
+    };
+
+    #[cfg(not(target_os = "android"))]
+    let img = {
+        let tauri_img = handle.clipboard().read_image()
+            .map_err(|e| format!("Failed to read clipboard: {:?}", e))?;
+
+        // Get RGBA data - this returns &[u8], not a Result
+        let rgba_data = tauri_img.rgba();
+
+        // Convert to ImageBuffer
+        ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(
+            tauri_img.width(),
+            tauri_img.height(),
+            rgba_data.to_vec()
+        ).ok_or_else(|| "Failed to create image buffer".to_string())?
+    };
 
     // Create the encoder directly with a Vec<u8>
     let mut png_data = Vec::new();
     let encoder = ::image::codecs::png::PngEncoder::new(&mut png_data);
 
     // Get original pixels
-    let original_pixels = img.rgba();
+    let original_pixels = img.as_raw();
 
-    // Windows: check that every image has a non-zero-ish Alpha channel, if not, this is probably a non-PNG/GIF which has had it's Alpha channel nuked
+    // Windows: check that every image has a non-zero-ish Alpha channel
     let mut _transparency_bug_search = false;
     #[cfg(target_os = "windows")]
     {
         _transparency_bug_search = original_pixels.iter().skip(3).step_by(4).all(|&a| a <= 2);
     }
 
-    // For non-transparent images: we need to manually account for the zero'ing out of the Alpha channel
+    // For non-transparent images: manually account for the zero'ing out of the Alpha channel
     let pixels = if !transparent || _transparency_bug_search {
         // Only clone if we need to modify
         let mut modified = original_pixels.to_vec();
@@ -552,11 +622,11 @@ pub async fn paste_message<R: Runtime>(handle: AppHandle<R>, receiver: String, r
 
     // Encode directly from pixels to PNG bytes
     encoder.write_image(
-        &pixels,               // raw pixels
-        img.width(),           // width
-        img.height(),          // height
-        ::image::ExtendedColorType::Rgba8                  // color type
-    ).map_err(|e| e.to_string()).unwrap();
+        &pixels,
+        img.width(),
+        img.height(),
+        ::image::ExtendedColorType::Rgba8
+    ).map_err(|e| e.to_string())?;
 
     // Generate image metadata with Blurhash and dimensions
     let img_meta: Option<ImageMetadata> = match blurhash::encode(4, 3, img.width(), img.height(), &pixels) {
@@ -594,47 +664,52 @@ pub async fn voice_message(receiver: String, replied_to: String, bytes: Vec<u8>)
 
 #[tauri::command]
 pub async fn file_message(receiver: String, replied_to: String, file_path: String) -> Result<bool, String> {
-    // Parse the file extension
-    let ext = file_path.clone().rsplit('.').next().unwrap_or("").to_lowercase();
+    // Load the file as AttachmentFile
+    let mut attachment_file = {
+        #[cfg(not(target_os = "android"))]
+        {
+            // Read file bytes
+            let bytes = std::fs::read(&file_path)
+                .map_err(|e| format!("Failed to read file: {}", e))?;
 
-    // Load the file
-    let bytes = std::fs::read(file_path.as_str()).unwrap();
+            // Extract extension from filepath
+            let extension = file_path
+                .rsplit('.')
+                .next()
+                .unwrap_or("bin")
+                .to_lowercase();
+
+            AttachmentFile {
+                bytes,
+                img_meta: None,
+                extension,
+            }
+        }
+        #[cfg(target_os = "android")]
+        {
+            filesystem::read_android_uri(file_path)?
+        }
+    };
 
     // Generate image metadata if the file is an image
-    let img_meta: Option<ImageMetadata> = match ext.as_str() {
-        "png" | "jpg" | "jpeg" | "gif" | "webp" => {
-            // Try to load and decode the image
-            match ::image::load_from_memory(&bytes) {
-                Ok(img) => {
-                    // Convert to RGBA8 format for blurhash
-                    let rgba_img = img.to_rgba8();
-                    let (width, height) = rgba_img.dimensions();
-                    let pixels = rgba_img.as_raw();
-                    
-                    // Generate Blurhash
-                    match blurhash::encode(4, 3, width, height, pixels) {
-                        Ok(hash) => {
-                            Some(ImageMetadata {
-                                blurhash: hash,
-                                width,
-                                height,
-                            })
-                        },
-                        Err(_) => None
-                    }
-                },
-                Err(_) => None
-            }
-        },
-        _ => None // Not an image file
-    };
+    if matches!(attachment_file.extension.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
+        // Try to load and decode the image
+        if let Ok(img) = ::image::load_from_memory(&attachment_file.bytes) {
+            // Convert to RGBA8 format for blurhash
+            let rgba_img = img.to_rgba8();
+            let (width, height) = rgba_img.dimensions();
+            let pixels = rgba_img.as_raw();
 
-    // Generate an Attachment File
-    let attachment_file = AttachmentFile {
-        bytes,
-        img_meta,
-        extension: ext.to_string()
-    };
+            // Generate Blurhash
+            if let Ok(hash) = blurhash::encode(4, 3, width, height, pixels) {
+                attachment_file.img_meta = Some(ImageMetadata {
+                    blurhash: hash,
+                    width,
+                    height,
+                });
+            }
+        }
+    }
 
     // Message the file to the intended user
     message(receiver, String::new(), replied_to, Some(attachment_file)).await

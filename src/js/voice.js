@@ -27,8 +27,12 @@ class VoiceRecorder {
             await invoke('start_recording');
             this.isRecording = true;
             this.button.innerHTML = '<span class="icon icon-mic-off"></span>';
+            return true;
         } catch (err) {
             console.error('Recording start failed:', err);
+            await popupConfirm('Recording Error', err, true);
+            this.isRecording = false;
+            return false;
         }
     }
 
@@ -313,17 +317,6 @@ function createTranscriptionUI(transcriptionData, audioElement) {
     
     return transcriptionText;
 }
-
-// Initialize when DOM is ready
-document.addEventListener('DOMContentLoaded', async () => {
-    // Initialize voice transcription with default model
-    window.cTranscriber = new VoiceTranscriptionUI();
-    window.voiceSettings = new VoiceSettings();
-
-    // Load our modules chronologically
-    await window.voiceSettings.loadWhisperModels();
-    window.voiceSettings.initVoiceSettings();
-});
 
 /**
  * Handles audio attachment rendering and transcription functionality.
@@ -662,8 +655,8 @@ function handleAudioAttachment(cAttachment, assetUrl, pMessage, msg) {
         }
     });
 
-    // Only add transcription UI for supported formats
-    if (['wav', 'mp3', 'flac'].includes(cAttachment.extension)) {
+    // Only add transcription UI for supported formats and platforms
+    if (platformFeatures.transcription && ['wav', 'mp3', 'flac'].includes(cAttachment.extension)) {
         // Display the Transcribe button
         customPlayer.appendChild(transcribeBtn);
         
