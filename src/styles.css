@@ -103,6 +103,10 @@
   mask-image: url("./icons/chevron-double-left.svg");
 }
 
+.icon-edit-user {
+  mask-image: url("./icons/edit-user.svg");
+}
+
 .icon-file-plus {
   mask-image: url("./icons/file-plus.svg");
 }
@@ -113,6 +117,14 @@
 
 .icon-settings {
   mask-image: url("./icons/settings.svg");
+}
+
+.icon-volume-mute {
+  mask-image: url("./icons/volume-mute.svg");
+}
+
+.icon-volume-max {
+  mask-image: url("./icons/volume-max.svg");
 }
 
 :root {
@@ -373,6 +385,24 @@ body {
   align-items: center;
   justify-content: center;
   cursor: pointer;
+}
+
+.profile-options {
+  display: flex;
+  justify-content: center;
+  height: 50px;
+  margin-top: 30px;
+  margin-bottom: 30px;
+}
+
+.profile-option {
+  background-color: #393b3c;
+  padding: 8px 10px 8px 10px;
+  margin-left: 6px;
+  margin-right: 6px;
+  height: 50px;
+  width: 50px;
+  border-radius: 12px;
 }
 
 /* Profile npub Section */

@@ -26,6 +26,7 @@ pub struct SlimProfile {
     pub id: String,
     name: String,
     display_name: String,
+    nickname: String,
     lud06: String,
     lud16: String,
     banner: String,
@@ -35,6 +36,7 @@ pub struct SlimProfile {
     nip05: String,
     last_read: String,
     status: Status,
+    muted: bool,
     // Omitting: messages, last_updated, typing_until, mine
 }
 
@@ -44,6 +46,7 @@ impl Default for SlimProfile {
             id: String::new(),
             name: String::new(),
             display_name: String::new(),
+            nickname: String::new(),
             lud06: String::new(),
             lud16: String::new(),
             banner: String::new(),
@@ -53,6 +56,7 @@ impl Default for SlimProfile {
             nip05: String::new(),
             last_read: String::new(),
             status: Status::new(),
+            muted: false,
         }
     }
 }
@@ -63,6 +67,7 @@ impl From<&Profile> for SlimProfile {
             id: profile.id.clone(),
             name: profile.name.clone(),
             display_name: profile.display_name.clone(),
+            nickname: profile.nickname.clone(),
             lud06: profile.lud06.clone(),
             lud16: profile.lud16.clone(),
             banner: profile.banner.clone(),
@@ -72,6 +77,7 @@ impl From<&Profile> for SlimProfile {
             nip05: profile.nip05.clone(),
             last_read: profile.last_read.clone(),
             status: profile.status.clone(),
+            muted: profile.muted,
         }
     }
 }
@@ -83,6 +89,7 @@ impl SlimProfile {
             id: self.id.clone(),
             name: self.name.clone(),
             display_name: self.display_name.clone(),
+            nickname: self.nickname.clone(),
             lud06: self.lud06.clone(),
             lud16: self.lud16.clone(),
             banner: self.banner.clone(),
@@ -96,6 +103,7 @@ impl SlimProfile {
             last_updated: 0,      // Default value
             typing_until: 0,      // Default value
             mine: false,          // Default value
+            muted: self.muted,
         }
     }
 }

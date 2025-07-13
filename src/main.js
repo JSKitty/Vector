@@ -33,9 +33,11 @@ let domProfileBanner = document.getElementById('profile-banner');
 let domProfileAvatar = document.getElementById('profile-avatar');
 const domProfileNameSecondary = document.getElementById('profile-secondary-name');
 const domProfileStatusSecondary = document.getElementById('profile-secondary-status');
-const domProfileBadges = document.getElementById('profile-badge-list');
 const domProfileDescription = document.getElementById('profile-description');
 const domProfileDescriptionEditor = document.getElementById('profile-description-editor');
+const domProfileOptions = document.getElementById('profile-option-list');
+const domProfileOptionMute = document.getElementById('profile-option-mute');
+const domProfileOptionNickname = document.getElementById('profile-option-nickname');
 const domProfileId = document.getElementById('profile-id');
 
 const domChats = document.getElementById('chats');
@@ -527,7 +529,7 @@ function renderChatlist() {
  */
 function renderContact(chat) {
     // Collect the Unread Message count for 'Unread' emphasis and badging
-    const nUnread = countUnreadMessages(chat);
+    const nUnread = chat.muted ? 0 : countUnreadMessages(chat);
 
     // The Contact container (The ID is the Contact's npub)
     const divContact = document.createElement('div');
@@ -549,7 +551,7 @@ function renderContact(chat) {
         divAvatarContainer.appendChild(imgAvatar);
     } else {
         // Otherwise, generate a Gradient Avatar
-        divAvatarContainer.appendChild(pubkeyToAvatar(chat.id, chat?.name, 50));
+        divAvatarContainer.appendChild(pubkeyToAvatar(chat.id, chat?.nickname || chat?.name, 50));
     }
 
     // Add the "Status Icon" to the avatar, then plug-in the avatar container
@@ -582,8 +584,8 @@ function renderContact(chat) {
 
     // Add the name (or, if missing metadata, their npub instead) to the chat preview
     const h4ContactName = document.createElement('h4');
-    h4ContactName.textContent = chat?.name || chat.id;
-    if (chat?.name) twemojify(h4ContactName);
+    h4ContactName.textContent = chat?.nickname || chat?.name || chat.id;
+    if (chat?.nickname || chat?.name) twemojify(h4ContactName);
     h4ContactName.classList.add('cutoff')
     divPreviewContainer.appendChild(h4ContactName);
 
@@ -881,6 +883,27 @@ async function setupRustListeners() {
         }
         // Render the Chat List
         renderChatlist();
+    });
+
+    await listen('profile_muted', (evt) => {
+        const cProfile = arrChats.find(p => p.id === evt.payload.profile_id);
+        cProfile.muted = evt.payload.value;
+
+        // If this profile is Expanded, update the Mute UI
+        if (domProfileId.textContent === cProfile.id) {
+            domProfileOptionMute.querySelector('span').classList.replace('icon-volume-' + (cProfile.muted ? 'max' : 'mute'), 'icon-volume-' + (cProfile.muted ? 'mute' : 'max'));
+            domProfileOptionMute.querySelector('p').innerText = cProfile.muted ? 'Unmute' : 'Mute';
+        }
+    });
+
+    await listen('profile_nick_changed', (evt) => {
+        const cProfile = arrChats.find(p => p.id === evt.payload.profile_id);
+        cProfile.nickname = evt.payload.value;
+
+        // If this profile is Expanded, update the UI
+        if (domProfileId.textContent === cProfile.id) {
+            renderProfileTab(cProfile);
+        }
     });
 
     // Listen for incoming messages
@@ -1227,7 +1250,7 @@ function renderCurrentProfile(cProfile) {
         domAvatar.src = cProfile.avatar;
     } else {
         // Display our Gradient Avatar
-        domAvatar = pubkeyToAvatar(strPubkey, cProfile?.name, 50);
+        domAvatar = pubkeyToAvatar(strPubkey, cProfile?.nickname || cProfile?.name, 50);
     }
     domAvatar.classList.add('btn');
     domAvatar.onclick = askForAvatar;
@@ -1235,14 +1258,14 @@ function renderCurrentProfile(cProfile) {
 
     // Render our Display Name and npub
     const h2DisplayName = document.createElement('h2');
-    h2DisplayName.textContent = cProfile?.name || strPubkey.substring(0, 10) + '…';
+    h2DisplayName.textContent = cProfile?.nickname || cProfile?.name || strPubkey.substring(0, 10) + '…';
     h2DisplayName.classList.add('btn', 'cutoff');
     h2DisplayName.style.fontFamily = `Rubik`;
     h2DisplayName.style.marginTop = `auto`;
     h2DisplayName.style.marginBottom = `auto`;
     h2DisplayName.style.maxWidth = `calc(100% - 150px)`;
     h2DisplayName.onclick = askForUsername;
-    if (cProfile?.name) twemojify(h2DisplayName);
+    if (cProfile?.nickname || cProfile?.name) twemojify(h2DisplayName);
     divRow.appendChild(h2DisplayName);
 
     // Add the username row
@@ -1267,8 +1290,8 @@ function renderCurrentProfile(cProfile) {
  */
 function renderProfileTab(cProfile) {
     // Display Name
-    domProfileName.innerHTML = cProfile?.name || strPubkey.substring(0, 10) + '…';
-    if (cProfile?.name) twemojify(domProfileName);
+    domProfileName.innerHTML = cProfile?.nickname || cProfile?.name || strPubkey.substring(0, 10) + '…';
+    if (cProfile?.nickname || cProfile?.name) twemojify(domProfileName);
 
     // Status
     const strStatusPlaceholder = cProfile.mine ? 'Set a Status' : '';
@@ -1308,7 +1331,7 @@ function renderProfileTab(cProfile) {
         }
         domProfileAvatar.src = cProfile.avatar;
     } else {
-        const newAvatar = pubkeyToAvatar(strPubkey, cProfile?.name);
+        const newAvatar = pubkeyToAvatar(strPubkey, cProfile?.nickname || cProfile?.name);
         domProfileAvatar.replaceWith(newAvatar);
         domProfileAvatar = newAvatar;
     }
@@ -1318,8 +1341,8 @@ function renderProfileTab(cProfile) {
 
     // Secondary Display Name
     const strNamePlaceholder = cProfile.mine ? 'Set a Display Name' : '';
-    domProfileNameSecondary.innerHTML = cProfile?.name || strNamePlaceholder;
-    if (cProfile?.name) twemojify(domProfileNameSecondary);
+    domProfileNameSecondary.innerHTML = cProfile?.nickname || cProfile?.name || strNamePlaceholder;
+    if (cProfile?.nickname || cProfile?.name) twemojify(domProfileNameSecondary);
 
     // Secondary Status
     domProfileStatusSecondary.innerHTML = domProfileStatus.innerHTML;
@@ -1354,8 +1377,11 @@ function renderProfileTab(cProfile) {
         }
     });
 
-    // If this is OUR profile: make the elements clickable
+    // If this is OUR profile: make the elements clickable, hide the "Contact Options"
     if (cProfile.mine) {
+        // Hide Contact Options
+        domProfileOptions.style.display = 'none';
+
         // Show edit buttons and set their click handlers
         document.querySelector('.profile-avatar-edit').style.display = 'flex';
         document.querySelector('.profile-avatar-edit').onclick = askForAvatar;
@@ -1382,6 +1408,24 @@ function renderProfileTab(cProfile) {
         domProfileDescription.onclick = editProfileDescription;
         domProfileDescription.classList.add('btn');
     } else {
+        // Show Contact Options
+        domProfileOptions.style.display = '';
+
+        // Setup Mute option
+        domProfileOptionMute.querySelector('span').classList.replace('icon-volume-' + (cProfile.muted ? 'max' : 'mute'), 'icon-volume-' + (cProfile.muted ? 'mute' : 'max'));
+        domProfileOptionMute.querySelector('p').innerText = cProfile.muted ? 'Unmute' : 'Mute';
+        domProfileOptionMute.onclick = () => invoke('toggle_muted', { npub: cProfile.id });
+
+        // Setup Nickname option
+        domProfileOptionNickname.onclick = async () => {
+            const nick = await popupConfirm('Choose a Nickname', '', false, 'Nickname');
+            // Check if they cancelled the nicknaming (resetting a nickname with an empty '' result is fine, though)
+            if (nick === false) return;
+            // Ensure it's not massive
+            if (nick.length >= 30) return popupConfirm('Woah woah!', 'A ' + nick.length + '-character nickname seems excessive!', true);
+            await invoke('set_nickname', { npub: cProfile.id, nickname: nick });
+        }
+
         // Hide edit buttons
         document.querySelector('.profile-avatar-edit').style.display = 'none';
         document.querySelector('.profile-banner-edit').style.display = 'none';
@@ -1612,8 +1656,8 @@ async function updateChat(profile, arrMessages = [], fClicked = false) {
             domChatContact.textContent = 'Notes';
             domChatContact.classList.remove('btn');
         } else {
-            domChatContact.textContent = profile?.name || strOpenChat.substring(0, 10) + '…';
-            if (profile?.name) twemojify(domChatContact);
+            domChatContact.textContent = profile?.nickname || profile?.name || strOpenChat.substring(0, 10) + '…';
+            if (profile?.nickname || profile?.name) twemojify(domChatContact);
             // When the name or status is clicked, expand their Profile
             domChatContact.onclick = () => {
                 closeChat();
@@ -1628,7 +1672,7 @@ async function updateChat(profile, arrMessages = [], fClicked = false) {
         } else {
             const fIsTyping = profile?.typing_until ? profile.typing_until > Date.now() / 1000 : false;
             if (fIsTyping) {
-                domChatContactStatus.textContent = `${profile?.name || 'User'} is typing...`;
+                domChatContactStatus.textContent = `${profile?.nickname || profile?.name || 'User'} is typing...`;
                 domChatContactStatus.classList.add('text-gradient');
             } else {
                 domChatContactStatus.textContent = profile?.status?.title || '';
@@ -1801,7 +1845,7 @@ async function updateChat(profile, arrMessages = [], fClicked = false) {
         if (fNotes) {
             domChatContact.textContent = 'Notes';
         } else {
-            domChatContact.textContent = profile?.name || strOpenChat.substring(0, 10) + '…';
+            domChatContact.textContent = profile?.nickname || profile?.name || strOpenChat.substring(0, 10) + '…';
         }
         // There's no profile to render; so don't allow clicking them to expand it
         domChatContact.onclick = null;
@@ -1961,8 +2005,8 @@ function renderMessage(msg, sender, editID = '') {
 
             // Name
             const cSenderProfile = !cMsg.mine ? sender : arrChats.find(a => a.mine);
-            if (cSenderProfile.name) {
-                spanName.textContent = cSenderProfile.name;
+            if (cSenderProfile.nickname || cSenderProfile.name) {
+                spanName.textContent = cSenderProfile.nickname || cSenderProfile.name;
                 twemojify(spanName);
             } else {
                 spanName.textContent = cSenderProfile.id.substring(0, 10) + '…';
